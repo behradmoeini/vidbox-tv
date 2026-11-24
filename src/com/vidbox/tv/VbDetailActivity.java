@@ -3,657 +3,426 @@ package com.vidbox.tv;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.Intent;
-import android.graphics.Color;
 import android.graphics.drawable.ColorDrawable;
-import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
 import android.text.TextUtils;
 import android.view.Gravity;
-import android.view.KeyEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
-import android.widget.FrameLayout;
+import android.widget.BaseAdapter;
 import android.widget.HorizontalScrollView;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
-import android.widget.ProgressBar;
-import android.widget.ScrollView;
+import android.widget.ListView;
 import android.widget.TextView;
-import android.widget.Toast;
 
 import org.json.JSONObject;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 
 /**
- * TV Detail screen for Movies and TV Shows.
+ * One film or series: poster, facts, overview, the buttons (play or resume, start over, watchlist,
+ * server), and underneath either the seasons and episodes of a series or more films like this one.
  *
- * Shows full metadata, overview, genres, cast, play/resume button, watchlist button,
- * server switcher, season & episode horizontal selector (for TV series), and similar titles.
+ * Exported, so a launcher can open a title directly: extras {@code id} (TMDB id) and {@code type}
+ * ("movie" or "tv"); {@code play=true} starts playing at once.
  */
 public class VbDetailActivity extends Activity {
     private Vb.Item item;
     private Vb.Detail detail;
-    private String selectedServerName = Vb.SERVERS.get(0).name;
-    private int selectedSeasonNumber = 1;
-    private int selectedEpisodeNumber = 1;
+    private boolean isShow;
+    private final List<Vb.Episode> shown = new ArrayList<>();
+    private final Rows rows = new Rows();
+    private int season = -1, seasonGen;
 
-    private int screenW, screenH;
-    private ImageView backdropView;
-    private ScrollView mainScrollView;
-    private LinearLayout contentBox;
-    private ProgressBar loadingSpinner;
-
-    private TextView playButton;
-    private TextView watchlistButton;
-    private TextView serverButton;
-
-    // TV Season & Episodes
-    private LinearLayout tvSeasonContainer;
-    private LinearLayout seasonTabsRow;
-    private LinearLayout episodeCardsRow;
+    private ImageView poster;
+    private TextView title, info, overview, play, restart, watch, server;
+    private LinearLayout col, seasonRow, similarLine;
+    private ListView list;
 
     @Override
-    protected void onCreate(Bundle savedInstanceState) {
-        super.onCreate(savedInstanceState);
+    protected void onCreate(Bundle b) {
+        super.onCreate(b);
         Vb.init(this);
-
+        try {
+            String json = getIntent().getStringExtra("item_json");
+            if (json != null) item = Vb.Item.fromJson(new JSONObject(json));
+        } catch (Exception ignored) {
+        }
+        if (item == null) {
+            long id = getIntent().getLongExtra("id", 0);
+            if (id <= 0) {
+                finish();
+                return;
+            }
+            item = new Vb.Item();
+            item.id = id;
+            item.type = Vb.TYPE_TV.equals(getIntent().getStringExtra("type")) ? Vb.TYPE_TV : Vb.TYPE_MOVIE;
+            item.title = "";
+        }
+        isShow = Vb.TYPE_TV.equals(item.type);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN);
         getWindow().setBackgroundDrawable(new ColorDrawable(VbUi.BG));
 
-        screenW = getResources().getDisplayMetrics().widthPixels;
-        screenH = getResources().getDisplayMetrics().heightPixels;
+        int pad = VbUi.dp(this, 40);
+        LinearLayout root = new LinearLayout(this);
+        root.setPadding(pad, pad, pad, VbUi.dp(this, 20));
+        root.setClipChildren(false);
 
-        // Parse extras
-        long id = getIntent().getLongExtra("id", 0);
-        String type = getIntent().getStringExtra("type");
-        String json = getIntent().getStringExtra("item_json");
+        poster = new ImageView(this);
+        poster.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        poster.setBackground(VbUi.round(VbUi.PANEL, VbUi.dp(this, 10), 0, 0));
+        poster.setClipToOutline(true);
+        int pw = VbUi.dp(this, 200);
+        root.addView(poster, VbUi.lp(pw, pw * 3 / 2, 0, 0, VbUi.dp(this, 32), 0));
+        VbUi.image(poster, VbUi.sized(item.getPosterUrl(), 342), pw);
 
-        if (json != null) {
-            try {
-                item = Vb.Item.fromJson(new JSONObject(json));
-            } catch (Exception ignored) {}
+        col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        col.setClipChildren(false);
+        root.addView(col, new LinearLayout.LayoutParams(0, -1, 1f));
+
+        title = VbUi.label(this, item.title, 30, VbUi.TEXT, true);
+        title.setSingleLine(true);
+        title.setEllipsize(TextUtils.TruncateAt.END);
+        col.addView(title);
+        info = VbUi.label(this, facts(), 14, VbUi.ACCENT, false);
+        info.setSingleLine(true);
+        info.setEllipsize(TextUtils.TruncateAt.END);
+        col.addView(info, VbUi.lp(-1, -2, 0, VbUi.dp(this, 4), 0, VbUi.dp(this, 10)));
+
+        overview = VbUi.label(this, item.overview == null ? "" : item.overview, 15, VbUi.DIM, false);
+        overview.setMaxLines(isShow ? 3 : 4);
+        overview.setEllipsize(TextUtils.TruncateAt.END);
+        overview.setLineSpacing(0, 1.15f);
+        col.addView(overview, VbUi.lp(-1, -2, 0, 0, 0, VbUi.dp(this, 14)));
+
+        LinearLayout buttons = new LinearLayout(this);
+        buttons.setGravity(Gravity.CENTER_VERTICAL);
+        play = VbUi.pill(this, "▶  Play");
+        play.setTextSize(17);
+        play.setOnClickListener(v -> playPrimary(false));
+        buttons.addView(play, VbUi.lp(-2, -2, 0, 0, VbUi.dp(this, 10), 0));
+        restart = VbUi.pill(this, "Start over");
+        restart.setOnClickListener(v -> playPrimary(true));
+        buttons.addView(restart, VbUi.lp(-2, -2, 0, 0, VbUi.dp(this, 10), 0));
+        watch = VbUi.pill(this, "");
+        watch.setOnClickListener(v -> {
+            Vb.toggleWatchlist(item);
+            refreshButtons();
+        });
+        buttons.addView(watch, VbUi.lp(-2, -2, 0, 0, VbUi.dp(this, 10), 0));
+        server = VbUi.pill(this, "");
+        server.setOnClickListener(v -> pickServer());
+        buttons.addView(server);
+        col.addView(buttons, VbUi.lp(-1, -2, 0, 0, 0, VbUi.dp(this, 14)));
+
+        if (isShow) {
+            HorizontalScrollView hs = new HorizontalScrollView(this);
+            hs.setHorizontalScrollBarEnabled(false);
+            seasonRow = new LinearLayout(this);
+            hs.addView(seasonRow);
+            col.addView(hs, VbUi.lp(-1, -2, 0, 0, 0, VbUi.dp(this, 8)));
+
+            list = new ListView(this);
+            list.setDivider(null);
+            list.setVerticalScrollBarEnabled(false);
+            list.setSelector(VbUi.round(0xFF26262C, VbUi.dp(this, 8), VbUi.dp(this, 3), 0xFFFFFFFF));
+            list.setDrawSelectorOnTop(false);
+            list.setAdapter(rows);
+            list.setOnItemClickListener((p, v, pos, id) -> playEpisode(shown.get(pos), false));
+            col.addView(list, new LinearLayout.LayoutParams(-1, 0, 1f));
+        } else {
+            // Films: a row of similar films fills the space a series uses for its episodes.
+            TextView head = VbUi.label(this, "More like this", 18, VbUi.TEXT, true);
+            head.setTag("similar");
+            col.addView(head, VbUi.lp(-2, -2, 0, VbUi.dp(this, 6), 0, 0));
+            HorizontalScrollView hs = new HorizontalScrollView(this);
+            hs.setHorizontalScrollBarEnabled(false);
+            hs.setClipToPadding(false);
+            hs.setClipChildren(false);
+            similarLine = new LinearLayout(this);
+            similarLine.setPadding(VbUi.dp(this, 8), VbUi.dp(this, 12), VbUi.dp(this, 8), VbUi.dp(this, 12));
+            similarLine.setClipToPadding(false);
+            similarLine.setClipChildren(false);
+            hs.addView(similarLine);
+            col.addView(hs, new LinearLayout.LayoutParams(-1, -2));
+            VbUi.gone(head, true);
         }
-        if (item == null && id > 0) {
-            item = new Vb.Item();
-            item.id = id;
-            item.type = type != null ? type : Vb.TYPE_MOVIE;
-        }
+        setContentView(root);
+        refreshButtons();
+        play.requestFocus();
 
-        if (item == null) {
-            finish();
+        Vb.async(() -> Vb.detail(item.type, item.id), (d, err) -> {
+            if (isFinishing()) return;
+            if (d == null) {
+                info.setText("Could not load the details: " + VbBrowseActivity.reason(err));
+                return;
+            }
+            onDetail(d);
+        });
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (item == null) return;
+        refreshButtons();
+        if (isShow && detail != null && !detail.seasons.isEmpty()) {
+            int[] cur = primaryEpisode();
+            if (cur[0] != season) showSeason(cur[0]);
+            else rows.notifyDataSetChanged();
+        }
+    }
+
+    private void onDetail(Vb.Detail d) {
+        detail = d;
+        // The list an item came from has less than the full record; keep what identifies it.
+        d.item.type = item.type;
+        item = d.item;
+        title.setText(item.title);
+        overview.setText(item.overview);
+        info.setText(facts());
+        VbUi.image(poster, VbUi.sized(item.getPosterUrl(), 342), VbUi.dp(this, 200));
+        refreshButtons();
+        if (isShow) {
+            if (d.seasons.isEmpty()) info.setText(facts() + "  ·  no episodes listed yet");
+            else buildSeasons();
+        } else {
+            buildSimilar();
+        }
+        if (getIntent().getBooleanExtra("play", false)) {
+            getIntent().removeExtra("play");
+            if (!isShow) playPrimary(false);
+        }
+    }
+
+    /** "Series · 2019 · ★ 8.4 · 3 seasons · Drama, Crime" */
+    private String facts() {
+        List<String> f = new ArrayList<>();
+        f.add(isShow ? "Series" : "Film");
+        if (item.year != null && !item.year.isEmpty()) f.add(item.year);
+        if (item.rating > 0) f.add(String.format(Locale.US, "★ %.1f", item.rating));
+        if (detail != null) {
+            if (isShow && detail.seasonsCount > 0) f.add(detail.seasonsCount + (detail.seasonsCount == 1 ? " season" : " seasons"));
+            if (!isShow && detail.runtime > 0) {
+                f.add(detail.runtime >= 60 ? detail.runtime / 60 + " h " + detail.runtime % 60 + " min" : detail.runtime + " min");
+            }
+            if (!detail.genres.isEmpty()) f.add(TextUtils.join(", ", detail.genres));
+        }
+        return TextUtils.join("  ·  ", f);
+    }
+
+    // ---------------------------------------------------------------- buttons
+
+    /** Season and episode Play should start: the one last watched, or the one after it if that was finished. */
+    private int[] primaryEpisode() {
+        int[] last = Vb.lastEpisode(item.id);
+        int first = detail == null || detail.seasons.isEmpty() ? 1 : detail.seasons.get(0).seasonNumber;
+        if (last == null) return new int[]{first, 1};
+        if (Vb.position(Vb.playKey(item.type, item.id, last[0], last[1])) != -1 || detail == null) return last;
+        int[] next = next(last[0], last[1]);
+        return next == null ? last : next;
+    }
+
+    /** The episode after this one, crossing into the next season; null after the last. */
+    private int[] next(int s, int e) {
+        for (int i = 0; i < detail.seasons.size(); i++) {
+            Vb.Season sn = detail.seasons.get(i);
+            if (sn.seasonNumber != s) continue;
+            if (e < sn.episodeCount) return new int[]{s, e + 1};
+            if (i + 1 < detail.seasons.size()) return new int[]{detail.seasons.get(i + 1).seasonNumber, 1};
+        }
+        return null;
+    }
+
+    private void refreshButtons() {
+        watch.setText(Vb.isInWatchlist(item.id, item.type) ? "✓  In watchlist" : "+  Add to watchlist");
+        int pin = Vb.pinnedServer();
+        server.setText("Server: " + (pin < 0 ? "Automatic" : Vb.SERVERS.get(pin).name));
+        if (!isShow) {
+            long pos = Vb.position(Vb.playKey(item.type, item.id, 0, 0));
+            play.setText(pos > 0 ? "▶  Resume from " + Vb.time(pos) : "▶  Play");
+            VbUi.gone(restart, pos <= 0);
+            if (pos <= 0 && restart.isFocused()) play.requestFocus();
             return;
         }
-
-        FrameLayout root = new FrameLayout(this);
-        setContentView(root);
-
-        // 1. Fullscreen Backdrop
-        backdropView = new ImageView(this);
-        backdropView.setScaleType(ImageView.ScaleType.CENTER_CROP);
-        backdropView.setLayoutParams(new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-        backdropView.setColorFilter(0xDD080C14, android.graphics.PorterDuff.Mode.SRC_ATOP);
-        root.addView(backdropView);
-
-        if (item.getBackdropUrl() != null) {
-            VbUi.load(backdropView, item.getBackdropUrl(), screenW, screenH, 0);
-        }
-
-        // 2. Loading Spinner
-        loadingSpinner = new ProgressBar(this);
-        FrameLayout.LayoutParams spinLp = new FrameLayout.LayoutParams(VbUi.dp(this, 50), VbUi.dp(this, 50), Gravity.CENTER);
-        loadingSpinner.setLayoutParams(spinLp);
-        root.addView(loadingSpinner);
-
-        // 3. Scrollable Detail Content
-        mainScrollView = new ScrollView(this);
-        mainScrollView.setLayoutParams(new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-        mainScrollView.setVerticalScrollBarEnabled(false);
-        mainScrollView.setClipToPadding(false);
-        mainScrollView.setPadding(VbUi.dp(this, 44), VbUi.dp(this, 36), VbUi.dp(this, 44), VbUi.dp(this, 44));
-
-        contentBox = new LinearLayout(this);
-        contentBox.setOrientation(LinearLayout.VERTICAL);
-        mainScrollView.addView(contentBox);
-        root.addView(mainScrollView);
-
-        // Fetch complete detail
-        loadDetail();
+        VbUi.gone(restart, true);
+        int[] e = primaryEpisode();
+        long pos = Vb.position(Vb.playKey(item.type, item.id, e[0], e[1]));
+        play.setText((pos > 0 ? "▶  Resume " : "▶  Play ") + "S" + e[0] + " E" + e[1]);
     }
 
-    private void loadDetail() {
-        loadingSpinner.setVisibility(View.VISIBLE);
-        Vb.getDetail(item.type, item.id, new Vb.Callback<Vb.Detail>() {
-            @Override
-            public void onSuccess(Vb.Detail d) {
-                loadingSpinner.setVisibility(View.GONE);
-                detail = d;
-                renderDetail();
-            }
-
-            @Override
-            public void onError(Exception e) {
-                loadingSpinner.setVisibility(View.GONE);
-                Toast.makeText(VbDetailActivity.this, "Failed to load details: " + e.getMessage(), Toast.LENGTH_SHORT).show();
-            }
-        });
-    }
-
-    private void renderDetail() {
-        contentBox.removeAllViews();
-
-        // 1. Title
-        TextView titleView = new TextView(this);
-        titleView.setText(detail.item.title);
-        titleView.setTextColor(VbUi.TEXT_WHITE);
-        titleView.setTextSize(30);
-        titleView.setTypeface(null, android.graphics.Typeface.BOLD);
-        contentBox.addView(titleView);
-
-        // Tagline (if any)
-        if (detail.tagline != null && !detail.tagline.isEmpty()) {
-            TextView tagView = new TextView(this);
-            tagView.setText("\"" + detail.tagline + "\"");
-            tagView.setTextColor(VbUi.TEXT_MUTED);
-            tagView.setTextSize(14);
-            tagView.setTypeface(null, android.graphics.Typeface.ITALIC);
-            tagView.setPadding(0, VbUi.dp(this, 3), 0, 0);
-            contentBox.addView(tagView);
-        }
-
-        // 2. Metadata badges (Year, Rating, Runtime/Seasons, HD badge, Genres)
-        LinearLayout metaRow = new LinearLayout(this);
-        metaRow.setOrientation(LinearLayout.HORIZONTAL);
-        metaRow.setGravity(Gravity.CENTER_VERTICAL);
-        metaRow.setPadding(0, VbUi.dp(this, 12), 0, VbUi.dp(this, 16));
-
-        if (detail.item.year != null && !detail.item.year.isEmpty()) {
-            addMetaBadge(metaRow, detail.item.year, VbUi.TEXT_WHITE, null);
-        }
-
-        if (detail.item.rating > 0) {
-            addMetaBadge(metaRow, String.format("★ %.1f", detail.item.rating), VbUi.STAR_YELLOW, null);
-        }
-
-        if (Vb.TYPE_MOVIE.equals(detail.item.type)) {
-            if (detail.runtime > 0) {
-                int hours = detail.runtime / 60;
-                int mins = detail.runtime % 60;
-                String rtStr = hours > 0 ? (hours + "h " + mins + "m") : (mins + "m");
-                addMetaBadge(metaRow, rtStr, VbUi.TEXT_MUTED, null);
-            }
-        } else {
-            if (detail.seasonsCount > 0) {
-                addMetaBadge(metaRow, detail.seasonsCount + (detail.seasonsCount == 1 ? " Season" : " Seasons"), VbUi.TEXT_MUTED, null);
-            }
-        }
-
-        // HD badge
-        addMetaBadge(metaRow, "HD", VbUi.ACCENT, VbUi.roundRect(0x2238BDF8, VbUi.dp(this, 4), VbUi.dp(this, 1), VbUi.ACCENT));
-
-        // Genre badges
-        for (String g : detail.genres) {
-            addMetaBadge(metaRow, g, VbUi.TEXT_MUTED, VbUi.roundRect(VbUi.CARD_BG, VbUi.dp(this, 4), 0, 0));
-        }
-        contentBox.addView(metaRow);
-
-        // 3. Action Buttons Row: [Play] [Watchlist] [Server]
-        buildActionButtons();
-
-        // 4. Overview paragraph
-        if (detail.item.overview != null && !detail.item.overview.isEmpty()) {
-            TextView overviewTitle = new TextView(this);
-            overviewTitle.setText("Synopsis");
-            overviewTitle.setTextColor(VbUi.TEXT_WHITE);
-            overviewTitle.setTextSize(16);
-            overviewTitle.setTypeface(null, android.graphics.Typeface.BOLD);
-            overviewTitle.setPadding(0, VbUi.dp(this, 18), 0, VbUi.dp(this, 6));
-            contentBox.addView(overviewTitle);
-
-            TextView overviewView = new TextView(this);
-            overviewView.setText(detail.item.overview);
-            overviewView.setTextColor(0xFFCBD5E1);
-            overviewView.setTextSize(14);
-            overviewView.setLineSpacing(VbUi.dp(this, 4), 1.0f);
-            overviewView.setMaxWidth(VbUi.dp(this, 800));
-            contentBox.addView(overviewView);
-        }
-
-        // 5. Cast Row
-        if (!detail.cast.isEmpty()) {
-            TextView castTitle = new TextView(this);
-            castTitle.setText("Starring: " + TextUtils.join(", ", detail.cast));
-            castTitle.setTextColor(VbUi.TEXT_MUTED);
-            castTitle.setTextSize(13);
-            castTitle.setPadding(0, VbUi.dp(this, 12), 0, 0);
-            contentBox.addView(castTitle);
-        }
-
-        // 6. For TV Shows: Seasons & Episodes lists
-        if (Vb.TYPE_TV.equals(detail.item.type) && !detail.seasons.isEmpty()) {
-            buildTvEpisodesSection();
-        }
-
-        // 7. Similar Titles Row
-        if (!detail.similar.isEmpty()) {
-            buildSimilarSection();
-        }
-
-        // Request initial focus on Play Button
-        if (playButton != null) {
-            playButton.post(() -> playButton.requestFocus());
-        }
-    }
-
-    private void addMetaBadge(LinearLayout row, String text, int textColor, GradientDrawable bg) {
-        TextView tv = new TextView(this);
-        tv.setText(text);
-        tv.setTextColor(textColor);
-        tv.setTextSize(12);
-        tv.setTypeface(null, android.graphics.Typeface.BOLD);
-        tv.setPadding(VbUi.dp(this, 8), VbUi.dp(this, 3), VbUi.dp(this, 8), VbUi.dp(this, 3));
-        if (bg != null) tv.setBackground(bg);
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        lp.setMargins(0, 0, VbUi.dp(this, 8), 0);
-        tv.setLayoutParams(lp);
-        row.addView(tv);
-    }
-
-    // ---------------------------------------------------------------- Action Buttons
-
-    private void buildActionButtons() {
-        LinearLayout btnRow = new LinearLayout(this);
-        btnRow.setOrientation(LinearLayout.HORIZONTAL);
-        btnRow.setGravity(Gravity.CENTER_VERTICAL);
-        btnRow.setPadding(0, VbUi.dp(this, 6), 0, VbUi.dp(this, 12));
-
-        // 1. Play Button
-        playButton = new TextView(this);
-        updatePlayButtonText();
-        playButton.setTextColor(0xFF0F172A);
-        playButton.setTextSize(15);
-        playButton.setTypeface(null, android.graphics.Typeface.BOLD);
-        playButton.setFocusable(true);
-        playButton.setFocusableInTouchMode(true);
-        playButton.setPadding(VbUi.dp(this, 26), VbUi.dp(this, 12), VbUi.dp(this, 26), VbUi.dp(this, 12));
-        playButton.setBackground(VbUi.roundRect(VbUi.ACCENT, VbUi.dp(this, 10), 0, 0));
-
-        playButton.setOnFocusChangeListener((v, hasFocus) -> {
-            if (hasFocus) {
-                playButton.setBackground(VbUi.roundRect(0xFFFFFFFF, VbUi.dp(this, 10), VbUi.dp(this, 3), VbUi.ACCENT));
-                VbUi.animateFocus(v, true, 1.08f);
-            } else {
-                playButton.setBackground(VbUi.roundRect(VbUi.ACCENT, VbUi.dp(this, 10), 0, 0));
-                VbUi.animateFocus(v, false, 1.0f);
-            }
-        });
-
-        playButton.setOnClickListener(v -> startPlayback(selectedSeasonNumber, selectedEpisodeNumber));
-        LinearLayout.LayoutParams playLp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        playLp.setMargins(0, 0, VbUi.dp(this, 14), 0);
-        playButton.setLayoutParams(playLp);
-        btnRow.addView(playButton);
-
-        // 2. Watchlist Button
-        watchlistButton = new TextView(this);
-        updateWatchlistButtonText();
-        watchlistButton.setTextSize(14);
-        watchlistButton.setFocusable(true);
-        watchlistButton.setFocusableInTouchMode(true);
-        watchlistButton.setPadding(VbUi.dp(this, 18), VbUi.dp(this, 12), VbUi.dp(this, 18), VbUi.dp(this, 12));
-        watchlistButton.setBackground(VbUi.roundRect(VbUi.CARD_BG, VbUi.dp(this, 10), VbUi.dp(this, 1), 0x33FFFFFF));
-
-        watchlistButton.setOnFocusChangeListener((v, hasFocus) -> {
-            if (hasFocus) {
-                watchlistButton.setTextColor(0xFFFFFFFF);
-                watchlistButton.setBackground(VbUi.roundRect(VbUi.CARD_FOCUSED, VbUi.dp(this, 10), VbUi.dp(this, 2), VbUi.ACCENT));
-                VbUi.animateFocus(v, true, 1.06f);
-            } else {
-                updateWatchlistButtonText();
-                VbUi.animateFocus(v, false, 1.0f);
-            }
-        });
-
-        watchlistButton.setOnClickListener(v -> {
-            Vb.toggleWatchlist(detail.item);
-            updateWatchlistButtonText();
-        });
-        LinearLayout.LayoutParams watchLp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        watchLp.setMargins(0, 0, VbUi.dp(this, 14), 0);
-        watchlistButton.setLayoutParams(watchLp);
-        btnRow.addView(watchlistButton);
-
-        // 3. Server Selector Button
-        serverButton = new TextView(this);
-        serverButton.setText("Server: " + selectedServerName + " ▾");
-        serverButton.setTextColor(VbUi.TEXT_WHITE);
-        serverButton.setTextSize(14);
-        serverButton.setFocusable(true);
-        serverButton.setFocusableInTouchMode(true);
-        serverButton.setPadding(VbUi.dp(this, 18), VbUi.dp(this, 12), VbUi.dp(this, 18), VbUi.dp(this, 12));
-        serverButton.setBackground(VbUi.roundRect(VbUi.CARD_BG, VbUi.dp(this, 10), VbUi.dp(this, 1), 0x33FFFFFF));
-
-        serverButton.setOnFocusChangeListener((v, hasFocus) -> {
-            if (hasFocus) {
-                serverButton.setTextColor(0xFFFFFFFF);
-                serverButton.setBackground(VbUi.roundRect(VbUi.CARD_FOCUSED, VbUi.dp(this, 10), VbUi.dp(this, 2), VbUi.ACCENT));
-                VbUi.animateFocus(v, true, 1.06f);
-            } else {
-                serverButton.setTextColor(VbUi.TEXT_WHITE);
-                serverButton.setBackground(VbUi.roundRect(VbUi.CARD_BG, VbUi.dp(this, 10), VbUi.dp(this, 1), 0x33FFFFFF));
-                VbUi.animateFocus(v, false, 1.0f);
-            }
-        });
-
-        serverButton.setOnClickListener(v -> showServerPicker());
-        btnRow.addView(serverButton);
-
-        contentBox.addView(btnRow);
-    }
-
-    private void updatePlayButtonText() {
-        if (playButton == null || detail == null) return;
-        if (detail.item.resumePosition > 0 && detail.item.duration > 0) {
-            long mins = detail.item.resumePosition / 60_000L;
-            playButton.setText(String.format("▶ Resume (%d min)", mins));
-        } else if (Vb.TYPE_TV.equals(detail.item.type)) {
-            playButton.setText(String.format("▶ Play S%d:E%d", selectedSeasonNumber, selectedEpisodeNumber));
-        } else {
-            playButton.setText("▶ Play Movie");
-        }
-    }
-
-    private void updateWatchlistButtonText() {
-        if (watchlistButton == null || detail == null) return;
-        boolean inList = Vb.isInWatchlist(detail.item.id, detail.item.type);
-        if (inList) {
-            watchlistButton.setText("✓ In Watchlist");
-            watchlistButton.setTextColor(VbUi.ACCENT);
-        } else {
-            watchlistButton.setText("+ Add to Watchlist");
-            watchlistButton.setTextColor(VbUi.TEXT_WHITE);
-        }
-    }
-
-    private void showServerPicker() {
-        String[] serverNames = new String[Vb.SERVERS.size()];
-        int currentIdx = 0;
-        for (int i = 0; i < Vb.SERVERS.size(); i++) {
-            serverNames[i] = Vb.SERVERS.get(i).name;
-            if (serverNames[i].equals(selectedServerName)) currentIdx = i;
-        }
-
-        new AlertDialog.Builder(this)
-                .setTitle("Select Streaming Server")
-                .setSingleChoiceItems(serverNames, currentIdx, (dialog, which) -> {
-                    selectedServerName = serverNames[which];
-                    serverButton.setText("Server: " + selectedServerName + " ▾");
-                    dialog.dismiss();
+    private void pickServer() {
+        String[] names = new String[Vb.SERVERS.size() + 1];
+        names[0] = "Automatic (the one working best now)";
+        for (int i = 1; i < names.length; i++) names[i] = Vb.SERVERS.get(i - 1).name;
+        new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                .setTitle("Play from")
+                .setSingleChoiceItems(names, Vb.pinnedServer() + 1, (d, which) -> {
+                    d.dismiss();
+                    Vb.pinServer(which - 1);
+                    refreshButtons();
                 })
-                .setNegativeButton("Cancel", null)
                 .show();
     }
 
-    // ---------------------------------------------------------------- TV Seasons & Episodes
+    // ---------------------------------------------------------------- series
 
-    private void buildTvEpisodesSection() {
-        tvSeasonContainer = new LinearLayout(this);
-        tvSeasonContainer.setOrientation(LinearLayout.VERTICAL);
-        tvSeasonContainer.setPadding(0, VbUi.dp(this, 24), 0, 0);
+    private void buildSeasons() {
+        seasonRow.removeAllViews();
+        for (final Vb.Season s : detail.seasons) {
+            TextView chip = VbUi.pill(this, "Season " + s.seasonNumber);
+            chip.setTag(s.seasonNumber);
+            chip.setOnClickListener(v -> showSeason(s.seasonNumber));
+            seasonRow.addView(chip, VbUi.lp(-2, -2, 0, 0, VbUi.dp(this, 8), 0));
+        }
+        VbUi.gone(seasonRow, detail.seasons.size() < 2);
+        showSeason(primaryEpisode()[0]);
+    }
 
-        TextView secTitle = new TextView(this);
-        secTitle.setText("Episodes");
-        secTitle.setTextColor(VbUi.TEXT_WHITE);
-        secTitle.setTextSize(18);
-        secTitle.setTypeface(null, android.graphics.Typeface.BOLD);
-        secTitle.setPadding(0, 0, 0, VbUi.dp(this, 12));
-        tvSeasonContainer.addView(secTitle);
+    private void showSeason(final int s) {
+        season = s;
+        final int gen = ++seasonGen;
+        for (int i = 0; i < seasonRow.getChildCount(); i++) {
+            TextView c = (TextView) seasonRow.getChildAt(i);
+            c.setSelected(((Integer) c.getTag()) == s);
+            VbUi.restyle(c);
+        }
+        shown.clear();
+        rows.notifyDataSetChanged();
+        Vb.async(() -> Vb.episodes(item.id, s), (eps, err) -> {
+            if (isFinishing() || gen != seasonGen) return;
+            if (eps == null) {
+                info.setText("Could not load the episodes: " + VbBrowseActivity.reason(err));
+                return;
+            }
+            info.setText(facts());
+            shown.addAll(eps);
+            rows.notifyDataSetChanged();
+            // The season's real length: TMDB's count includes episodes not broadcast yet.
+            for (Vb.Season sn : detail.seasons) if (sn.seasonNumber == s && !eps.isEmpty()) sn.episodeCount = eps.get(eps.size() - 1).episodeNumber;
+            int[] cur = primaryEpisode();
+            for (int i = 0; i < shown.size(); i++) {
+                if (cur[0] == s && shown.get(i).episodeNumber == cur[1]) list.setSelection(i);
+            }
+            if (getIntent().getBooleanExtra("play", false)) {
+                getIntent().removeExtra("play");
+                playPrimary(false);
+            }
+        });
+    }
 
-        // Season tabs horizontal scroll
-        HorizontalScrollView seasonScroll = new HorizontalScrollView(this);
-        seasonScroll.setHorizontalScrollBarEnabled(false);
-        seasonTabsRow = new LinearLayout(this);
-        seasonTabsRow.setOrientation(LinearLayout.HORIZONTAL);
-        seasonScroll.addView(seasonTabsRow);
-        tvSeasonContainer.addView(seasonScroll);
+    // ---------------------------------------------------------------- films
 
-        // Render Season pills
-        for (Vb.Season s : detail.seasons) {
-            TextView sTab = new TextView(this);
-            sTab.setText(s.name);
-            sTab.setTextSize(14);
-            sTab.setFocusable(true);
-            sTab.setFocusableInTouchMode(true);
-            sTab.setPadding(VbUi.dp(this, 16), VbUi.dp(this, 8), VbUi.dp(this, 16), VbUi.dp(this, 8));
-            updateSeasonTabStyle(sTab, s.seasonNumber == selectedSeasonNumber);
-
-            sTab.setOnFocusChangeListener((v, hasFocus) -> {
-                if (hasFocus) {
-                    sTab.setTextColor(0xFFFFFFFF);
-                    sTab.setBackground(VbUi.roundRect(VbUi.CARD_FOCUSED, VbUi.dp(this, 16), VbUi.dp(this, 2), VbUi.ACCENT));
-                    VbUi.animateFocus(v, true, 1.06f);
-                } else {
-                    updateSeasonTabStyle(sTab, s.seasonNumber == selectedSeasonNumber);
-                    VbUi.animateFocus(v, false, 1.0f);
-                }
-            });
-
-            sTab.setOnClickListener(v -> {
-                selectedSeasonNumber = s.seasonNumber;
-                for (int i = 0; i < seasonTabsRow.getChildCount(); i++) {
-                    View child = seasonTabsRow.getChildAt(i);
-                    if (child instanceof TextView) {
-                        updateSeasonTabStyle((TextView) child, detail.seasons.get(i).seasonNumber == selectedSeasonNumber);
+    private void buildSimilar() {
+        similarLine.removeAllViews();
+        // What is left under the buttons decides the card size, so the row never runs off the screen.
+        col.post(() -> {
+            View head = col.findViewWithTag("similar");
+            int h = Math.min(VbUi.dp(this, 170), col.getHeight() - head.getTop() - VbUi.dp(this, 90));
+            if (h < VbUi.dp(this, 90) || detail.similar.isEmpty()) return;
+            int w = h * 2 / 3;
+            for (final Vb.Item it : detail.similar) {
+                View card = VbUi.card(this, h);
+                VbUi.bind(card, it, w, false, null);
+                card.setFocusable(true);
+                card.setOnFocusChangeListener(VbUi::focus);
+                card.setOnClickListener(v -> {
+                    try {
+                        startActivity(new Intent(this, VbDetailActivity.class).putExtra("item_json", it.toJson().toString()));
+                    } catch (Exception ignored) {
                     }
-                }
-                loadEpisodesForSeason(selectedSeasonNumber);
-            });
-
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-            lp.setMargins(0, 0, VbUi.dp(this, 10), 0);
-            sTab.setLayoutParams(lp);
-            seasonTabsRow.addView(sTab);
-        }
-
-        // Horizontal scroll for episode cards
-        HorizontalScrollView epScroll = new HorizontalScrollView(this);
-        epScroll.setHorizontalScrollBarEnabled(false);
-        epScroll.setPadding(0, VbUi.dp(this, 14), 0, 0);
-
-        episodeCardsRow = new LinearLayout(this);
-        episodeCardsRow.setOrientation(LinearLayout.HORIZONTAL);
-        epScroll.addView(episodeCardsRow);
-        tvSeasonContainer.addView(epScroll);
-
-        contentBox.addView(tvSeasonContainer);
-
-        // Load season 1 episodes
-        loadEpisodesForSeason(selectedSeasonNumber);
-    }
-
-    private void updateSeasonTabStyle(TextView tv, boolean isSelected) {
-        if (isSelected) {
-            tv.setTextColor(0xFFFFFFFF);
-            tv.setBackground(VbUi.roundRect(VbUi.ACCENT_GRAD, VbUi.dp(this, 16), 0, 0));
-        } else {
-            tv.setTextColor(VbUi.TEXT_MUTED);
-            tv.setBackground(VbUi.roundRect(VbUi.CARD_BG, VbUi.dp(this, 16), 0, 0));
-        }
-    }
-
-    private void loadEpisodesForSeason(int sNum) {
-        episodeCardsRow.removeAllViews();
-        TextView loadingView = new TextView(this);
-        loadingView.setText("Loading episodes...");
-        loadingView.setTextColor(VbUi.TEXT_MUTED);
-        episodeCardsRow.addView(loadingView);
-
-        Vb.getSeasonEpisodes(detail.item.id, sNum, new Vb.Callback<List<Vb.Episode>>() {
-            @Override
-            public void onSuccess(List<Vb.Episode> episodes) {
-                episodeCardsRow.removeAllViews();
-                for (Vb.Episode ep : episodes) {
-                    episodeCardsRow.addView(createEpisodeCard(ep));
-                }
+                });
+                similarLine.addView(card, VbUi.lp(w, -2, 0, 0, VbUi.dp(this, 14), 0));
             }
-
-            @Override
-            public void onError(Exception e) {
-                episodeCardsRow.removeAllViews();
-                TextView errView = new TextView(VbDetailActivity.this);
-                errView.setText("Failed to load episodes: " + e.getMessage());
-                errView.setTextColor(VbUi.ACCENT_RED);
-                episodeCardsRow.addView(errView);
-            }
+            VbUi.gone(head, false);
         });
     }
 
-    private View createEpisodeCard(Vb.Episode ep) {
-        LinearLayout card = new LinearLayout(this);
-        card.setOrientation(LinearLayout.VERTICAL);
-        card.setFocusable(true);
-        card.setFocusableInTouchMode(true);
+    // ---------------------------------------------------------------- playing
 
-        int cardW = VbUi.dp(this, 220);
-        int thumbH = VbUi.dp(this, 124);
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(cardW, ViewGroup.LayoutParams.WRAP_CONTENT);
-        lp.setMargins(0, 0, VbUi.dp(this, 14), 0);
-        card.setLayoutParams(lp);
-        card.setBackground(VbUi.roundRect(VbUi.CARD_BG, VbUi.dp(this, 8), 0, 0));
-
-        // Thumbnail image
-        ImageView iv = new ImageView(this);
-        iv.setScaleType(ImageView.ScaleType.CENTER_CROP);
-        iv.setLayoutParams(new LinearLayout.LayoutParams(cardW, thumbH));
-        card.addView(iv);
-        VbUi.load(iv, ep.getStillUrl(), cardW, thumbH, VbUi.dp(this, 8));
-
-        // Episode info
-        LinearLayout textContainer = new LinearLayout(this);
-        textContainer.setOrientation(LinearLayout.VERTICAL);
-        textContainer.setPadding(VbUi.dp(this, 8), VbUi.dp(this, 8), VbUi.dp(this, 8), VbUi.dp(this, 8));
-
-        TextView numView = new TextView(this);
-        numView.setText("Episode " + ep.episodeNumber);
-        numView.setTextColor(VbUi.ACCENT);
-        numView.setTextSize(12);
-        numView.setTypeface(null, android.graphics.Typeface.BOLD);
-        textContainer.addView(numView);
-
-        TextView titleView = new TextView(this);
-        titleView.setText(ep.title);
-        titleView.setTextColor(VbUi.TEXT_WHITE);
-        titleView.setTextSize(13);
-        titleView.setMaxLines(1);
-        titleView.setEllipsize(TextUtils.TruncateAt.END);
-        titleView.setTypeface(null, android.graphics.Typeface.BOLD);
-        textContainer.addView(titleView);
-
-        card.addView(textContainer);
-
-        card.setOnFocusChangeListener((v, hasFocus) -> {
-            if (hasFocus) {
-                card.setBackground(VbUi.roundRect(VbUi.CARD_FOCUSED, VbUi.dp(this, 8), VbUi.dp(this, 2), VbUi.ACCENT));
-                VbUi.animateFocus(card, true, 1.06f);
-            } else {
-                card.setBackground(VbUi.roundRect(VbUi.CARD_BG, VbUi.dp(this, 8), 0, 0));
-                VbUi.animateFocus(card, false, 1.0f);
-            }
-        });
-
-        card.setOnClickListener(v -> {
-            selectedSeasonNumber = ep.seasonNumber;
-            selectedEpisodeNumber = ep.episodeNumber;
-            updatePlayButtonText();
-            startPlayback(ep.seasonNumber, ep.episodeNumber);
-        });
-
-        return card;
-    }
-
-    // ---------------------------------------------------------------- Similar Titles Section
-
-    private void buildSimilarSection() {
-        LinearLayout simContainer = new LinearLayout(this);
-        simContainer.setOrientation(LinearLayout.VERTICAL);
-        simContainer.setPadding(0, VbUi.dp(this, 28), 0, 0);
-
-        TextView secTitle = new TextView(this);
-        secTitle.setText("More Like This");
-        secTitle.setTextColor(VbUi.TEXT_WHITE);
-        secTitle.setTextSize(18);
-        secTitle.setTypeface(null, android.graphics.Typeface.BOLD);
-        secTitle.setPadding(0, 0, 0, VbUi.dp(this, 12));
-        simContainer.addView(secTitle);
-
-        HorizontalScrollView scroll = new HorizontalScrollView(this);
-        scroll.setHorizontalScrollBarEnabled(false);
-        LinearLayout row = new LinearLayout(this);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-
-        int cardW = VbUi.dp(this, 130);
-        int cardH = (int) (cardW * 1.48f);
-
-        for (Vb.Item it : detail.similar) {
-            FrameLayout c = new FrameLayout(this);
-            c.setFocusable(true);
-            c.setFocusableInTouchMode(true);
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(cardW, cardH);
-            lp.setMargins(0, 0, VbUi.dp(this, 10), 0);
-            c.setLayoutParams(lp);
-            c.setBackground(VbUi.roundRect(VbUi.CARD_BG, VbUi.dp(this, 8), 0, 0));
-
-            ImageView iv = new ImageView(this);
-            iv.setScaleType(ImageView.ScaleType.CENTER_CROP);
-            iv.setLayoutParams(new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-            c.addView(iv);
-            VbUi.load(iv, it.getPosterUrl(), cardW, cardH, VbUi.dp(this, 8));
-
-            c.setOnFocusChangeListener((v, hasFocus) -> {
-                if (hasFocus) {
-                    c.setBackground(VbUi.roundRect(VbUi.CARD_FOCUSED, VbUi.dp(this, 8), VbUi.dp(this, 2), VbUi.ACCENT));
-                    VbUi.animateFocus(c, true, 1.08f);
-                } else {
-                    c.setBackground(VbUi.roundRect(VbUi.CARD_BG, VbUi.dp(this, 8), 0, 0));
-                    VbUi.animateFocus(c, false, 1.0f);
-                }
-            });
-
-            c.setOnClickListener(v -> {
-                try {
-                    Intent intent = new Intent(this, VbDetailActivity.class);
-                    intent.putExtra("item_json", it.toJson().toString());
-                    intent.putExtra("id", it.id);
-                    intent.putExtra("type", it.type);
-                    startActivity(intent);
-                } catch (Exception ignored) {}
-            });
-            row.addView(c);
+    private void playPrimary(boolean startOver) {
+        if (!isShow) {
+            start(0, 0, startOver);
+        } else if (detail != null && !detail.seasons.isEmpty()) {
+            int[] e = primaryEpisode();
+            start(e[0], e[1], startOver);
         }
-        scroll.addView(row);
-        simContainer.addView(scroll);
-        contentBox.addView(simContainer);
     }
 
-    // ---------------------------------------------------------------- Launch Player
+    private void playEpisode(Vb.Episode e, boolean startOver) {
+        start(e.seasonNumber, e.episodeNumber, startOver);
+    }
 
-    private void startPlayback(int season, int episode) {
+    private void start(int s, int e, boolean startOver) {
+        Intent i = new Intent(this, VbPlayerActivity.class);
         try {
-            Intent intent = new Intent(this, VbPlayerActivity.class);
-            intent.putExtra("item_json", detail.item.toJson().toString());
-            intent.putExtra("id", detail.item.id);
-            intent.putExtra("type", detail.item.type);
-            intent.putExtra("title", detail.item.title);
-            intent.putExtra("imdb_id", detail.imdbId);
-            intent.putExtra("season", season);
-            intent.putExtra("episode", episode);
-            intent.putExtra("server_name", selectedServerName);
-            intent.putExtra("resume_pos", detail.item.resumePosition);
-            startActivity(intent);
-        } catch (Exception e) {
-            Toast.makeText(this, "Error starting playback: " + e.getMessage(), Toast.LENGTH_SHORT).show();
+            i.putExtra("item_json", item.toJson().toString());
+        } catch (Exception ex) {
+            return;
+        }
+        i.putExtra("imdb_id", detail == null ? null : detail.imdbId);
+        i.putExtra("season", s);
+        i.putExtra("episode", e);
+        i.putExtra("startOver", startOver);
+        if (isShow && detail != null) {
+            int n = detail.seasons.size();
+            int[] numbers = new int[n], counts = new int[n];
+            for (int k = 0; k < n; k++) {
+                numbers[k] = detail.seasons.get(k).seasonNumber;
+                counts[k] = detail.seasons.get(k).episodeCount;
+            }
+            i.putExtra("season_numbers", numbers);
+            i.putExtra("season_counts", counts);
+        }
+        if (getIntent().hasExtra("probe")) i.putExtra("probe", getIntent().getStringExtra("probe"));
+        startActivity(i);
+    }
+
+    private final class Rows extends BaseAdapter {
+        @Override
+        public int getCount() {
+            return shown.size();
+        }
+
+        @Override
+        public Object getItem(int pos) {
+            return shown.get(pos);
+        }
+
+        @Override
+        public long getItemId(int pos) {
+            return pos;
+        }
+
+        @Override
+        public View getView(int pos, View v, ViewGroup parent) {
+            VbDetailActivity c = VbDetailActivity.this;
+            LinearLayout row = (LinearLayout) v;
+            if (row == null) {
+                row = new LinearLayout(c);
+                row.setGravity(Gravity.CENTER_VERTICAL);
+                row.setPadding(VbUi.dp(c, 14), VbUi.dp(c, 10), VbUi.dp(c, 14), VbUi.dp(c, 10));
+                TextView num = VbUi.label(c, "", 16, VbUi.ACCENT, true);
+                row.addView(num, new LinearLayout.LayoutParams(VbUi.dp(c, 110), -2));
+                TextView name = VbUi.label(c, "", 16, VbUi.TEXT, false);
+                name.setSingleLine(true);
+                name.setEllipsize(TextUtils.TruncateAt.END);
+                row.addView(name, new LinearLayout.LayoutParams(0, -2, 1f));
+                TextView state = VbUi.label(c, "", 14, VbUi.DIM, false);
+                state.setPadding(VbUi.dp(c, 12), 0, 0, 0);
+                row.addView(state);
+            }
+            Vb.Episode e = shown.get(pos);
+            ((TextView) row.getChildAt(0)).setText("Episode " + e.episodeNumber);
+            ((TextView) row.getChildAt(1)).setText(e.title);
+            long p = Vb.position(Vb.playKey(item.type, item.id, e.seasonNumber, e.episodeNumber));
+            ((TextView) row.getChildAt(2)).setText(p == -1 ? "✓ watched" : p > 0 ? "resume from " + Vb.time(p) : "");
+            return row;
         }
     }
 }

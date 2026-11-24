@@ -1,127 +1,133 @@
-# Vidbox TV — Android TV Streaming App & Web Portal
+# Vidbox TV
 
-An ultra-lightweight, high-performance Android TV app and companion web portal that streams movies and TV shows from [vidbox.wtf](https://vidbox.wtf).
+An Android TV app that browses films and series (catalogue from TMDB) and plays them through the
+stream servers [vidbox.wtf](https://vidbox.wtf) uses. A companion web portal lives in `web/`.
 
-Built following the standalone architecture of `namayesh` in `alphadl-tv`:
-- **Plain Java (Android SDK only, zero third-party library dependencies)**
-- **Blazing fast command-line build** (`javac` → `d8` → `aapt2` → `zipalign` → `apksigner` in ~1.5s)
-- **Leanback Android TV UI**: 1080p/4K D-pad navigation, card scaling animations, dynamic blurred backdrop, TV remote controls
-- **Multi-Server Streaming**: Seamlessly resolves and switches between Vidbox providers (Echo / VidLink, Max / YTHD, 4K, Vidfast, V2, Vidpro, Premium, Nxsha, 2Embed, Cinemaos, and Vidbox direct sessions)
-- **Included Companion Web Portal (`web/`)**: Full-featured responsive web player and streaming portal
+Built the same way as «شبکه نمایش خانگی» in `alphadl-tv`: plain Java against the Android framework,
+no libraries, and a command-line build (`javac` → `d8` → `aapt2` → `zipalign` → `apksigner`).
 
----
-
-## Directory Structure
+## Layout
 
 ```
-vidbox-tv/
-├── README.md
-├── scripts/
-│   └── build.sh               # javac -> d8 -> aapt2 -> zipalign -> apksigner
-├── app/
-│   ├── AndroidManifest.xml    # Android TV & Leanback launcher manifest
-│   └── res/
-│       ├── drawable-xhdpi/
-│       │   └── banner.png     # 320x180 Android TV Leanback banner
-│       ├── mipmap-xxhdpi/
-│       │   └── icon.png       # High-res app launcher icon
-│       └── values/
-│           ├── strings.xml
-│           └── colors.xml
-├── src/com/vidbox/tv/
-│   ├── Vb.java                # Data layer: TMDB client, streaming server resolvers, cache, progress
-│   ├── VbUi.java              # TV UI styling, focus animations, two-tier image loader with disk cache
-│   ├── VbBrowseActivity.java  # Main TV screen: Home rows, Movies, TV Shows, Genres, Watchlist, Search
-│   ├── VbDetailActivity.java  # Detail screen: Backdrop, synopsis, cast, server picker, season & episode list
-│   ├── VbPlayerActivity.java  # Fullscreen TV player: Hardware-accelerated WebView, remote controls, ad-blocking
-│   └── VbUpdate.java          # Self-update mechanism via remote release manifest
-└── web/                       # Companion Web Streaming Portal
-    ├── index.html             # Responsive streaming web interface
-    ├── style.css              # Dark glassmorphism streaming theme
-    ├── app.js                 # Catalog & streaming engine
-    └── server.py              # Lightweight local HTTP server
+scripts/build.sh            builds build/VidboxTV.apk
+scripts/make-icons.swift    draws the TV home tile and the launcher icon
+app/AndroidManifest.xml
+app/res/                    banner.png (640x360), icon.png (192x192)
+src/com/vidbox/tv/
+  Vb.java                   catalogue (TMDB), stream servers, watch progress, watchlist
+  VbUi.java                 the shared look: buttons, poster cards, focus, image loader
+  VbBrowseActivity.java     Home rows; Movies, TV Shows, Genres, Watchlist, Search grids
+  VbDetailActivity.java     one title: facts, buttons, episodes or similar films
+  VbPlayerActivity.java     the player
+  VbUpdate.java             self-update; VbUpdated.java reopens the app after one
+.github/workflows/build-apk.yml   builds, signs and publishes every push to main
+.github/scripts/progress.sh       the "build progress" status on the commit
+web/                        companion web portal
 ```
 
----
+## The screens
 
-## Features
+**Browse.** A tab bar (Home, Movies, TV Shows, Genres, Watchlist, Search). Home is a page of rows,
+each a title and a line of cards: Continue watching, trending films and series, in cinemas now,
+four streaming services, top rated. Each row loads on its own, so one slow list does not hold up
+the page. The other tabs are a six-column poster grid that loads more as you go down. Genres has
+a Films/Series switch followed by that kind's genres.
 
-### 1. Android TV Browse Experience (`VbBrowseActivity`)
-- **Top Tab Bar**: `Home`, `Movies`, `TV Shows`, `Genres`, `Watchlist`, `Search`.
-- **Home Rows**:
-  - Continue Watching (with resume progress bar)
-  - Trending Movies (`/trending/movie/day`)
-  - Trending TV Shows (`/trending/tv/day`)
-  - Now Playing in Theaters (`/movie/now_playing`)
-  - Netflix Originals (`with_networks=213`)
-  - Amazon Prime Shows (`with_networks=1024`)
-  - Apple TV+ Shows (`with_networks=2552`)
-  - Disney+ Shows (`with_networks=2739`)
-  - Top Rated Movies & TV Shows
-- **D-Pad Focus & Dynamic Backdrops**: Moving focus across cards smoothly updates the fullscreen background backdrop to the focused title.
-- **Movies & Shows Grids**: 6-column poster grid with pagination and genre filtering chips.
+**Detail.** Poster, a line of facts, the overview, and the buttons: Play (or Resume from where you
+stopped), Start over, Add to watchlist, Server. A series shows its seasons and a list of episodes,
+each marked watched or with its resume time; Play picks up the episode you were on, or the next one
+if you finished it. A film shows a row of similar films.
 
-### 2. Title Details (`VbDetailActivity`)
-- Full synopsis, tagline, star rating, release year, runtime, HD badge, genre pills, and cast list.
-- **Action Buttons**:
-  - `[▶ Play / Resume]`: Primary action button, remembers exact resume positions.
-  - `[+ Watchlist]`: Local persistence in SharedPreferences.
-  - `[Server: Echo ▾]`: Dropdown dialog to select default streaming provider.
-- **TV Series Episode Picker**: Horizontal season selector tabs + horizontal list of episode cards with episode thumbnails, titles, and air dates.
+**Player.** See below.
 
-### 3. Fullscreen TV Player (`VbPlayerActivity`)
-- Hardware-accelerated `WebView` engineered specifically for Android TV remote navigation.
-- **Ad & Popup Blocking**: Custom `WebViewClient` blocks ad domains, popunders, and rogue redirects.
-- **TV Remote Key Map**:
-  - `DPAD_CENTER` / `OK` / `MEDIA_PLAY_PAUSE`: Play / Pause video.
-  - `DPAD_LEFT`: Seek backward 10 seconds (with visual OSD feedback).
-  - `DPAD_RIGHT`: Seek forward 10 seconds (with visual OSD feedback).
-  - `DPAD_DOWN`: Brings up the on-screen control bar (Server switcher, Previous Episode, Next Episode, Reload).
-  - `DPAD_UP`: Hides the control bar.
-  - `BACK`: Hides control bar if open; otherwise saves watch progress and returns to details.
-- **Auto-Save Progress**: Periodically records playback timestamps into local history.
+### Focus and the remote
 
-### 4. Streaming Providers Supported
-| Provider | Movie Embed | TV Embed | Notes |
-|---|---|---|---|
-| **Echo (VidLink)** | `https://vidlink.pro/movie/{id}` | `https://vidlink.pro/tv/{id}/{s}/{e}` | Primary server, customizable player |
-| **Max (YTHD)** | `https://ythd.org/embed/{id}` | `https://ythd.org/embed/{id}/{s}-{e}` | High reliability |
-| **4K (Vidrift)** | `https://embed.vidrift.net/embed/movie/{id}` | `https://embed.vidrift.net/embed/tv/{id}/{s}/{e}` | High bitrate streams |
-| **Vidfast** | `https://vidfast.vc/movie/{id}` | `https://vidfast.vc/tv/{id}/{s}/{e}` | Fast initial buffer |
-| **V2 (VAPlayer)** | `https://vaplayer.ru/embed/movie/{id}` | `https://vaplayer.ru/embed/tv/{id}/{s}/{e}` | Alternative CDN |
-| **Vidpro (Vixsrc)** | `https://vixsrc.to/movie/{id}` | `https://vixsrc.to/tv/{id}/{s}/{e}` | Multi-audio sources |
-| **Premium (Vidy)** | `https://www.vidy.st/movie/{id}` | `https://www.vidy.st/tv/{id}/{s}/{e}` | Direct player |
-| **Nxsha** | `https://nxsha.space/embed/movie/{id}` | `https://nxsha.space/embed/tv/{id}/{s}/{e}` | Multi-language subtitles |
-| **2Embed** | `https://2embed.stream/embed/movie/{id}` | `https://2embed.stream/embed/tv/{id}/{s}/{e}` | Backup mirror |
-| **Cinemaos** | `https://cinemaos.tech/player/{id}` | `https://cinemaos.tech/player/{id}/{s}/{e}` | Fallback |
+Focus looks the same everywhere: a button turns white with dark text; a poster card gets a white
+ring, grows slightly, and its title turns white and scrolls if it is too long to fit. There is no
+blur and no translucent layering, because the TV's graphics chip is weak.
 
----
+- Up from the first row or the top of a grid reaches the tabs.
+- Back from a page goes to its tab; Back on a tab goes to Home; Back on the Home tab leaves the app.
+- In the player: Left/Right seek (faster while held), OK pauses and plays. Down opens the button
+  row (previous episode, −10 s, play/pause, +10 s, next episode, speed, server); Up or Back leaves
+  it; Back again leaves the player.
 
-## Build & Installation
+## How playing works
 
-### Requirements
-- Android SDK build-tools (for `aapt2`, `zipalign`, `apksigner`, `d8`)
-- Java JDK 11+ (JDK 17 recommended)
-- `adb` (for installation)
+The stream servers are web pages with their own players, made for a mouse. Shown as they are on a
+TV they sit paused and muted waiting for a click, the remote does nothing useful, and adverts open
+over them. So the player opens the server's page out of sight in a WebView, taps the middle of it
+(many wait for a click), and blocks advert hosts, pop-ups and any attempt to navigate away. Once
+the page's `<video>` element has a film in it (longer than two minutes, so not an advert), only the
+picture is shown, full-screen, and that element is driven from the app: play, pause, seek, speed,
+and the position saved every five seconds for Resume.
 
-### Build the APK
+### Choosing the server
+
+Which servers work changes from hour to hour, so the list in `Vb.SERVERS` is not ranked by hand.
+The app remembers for each server whether it last produced a film and how long it took
+(`Vb.serverResult`), and tries them in that order (`Vb.serverOrder`): servers that have not been
+failing first, quickest to start first. A server that fails is pushed back for six hours and then
+gets another chance. If a page gives no video within 40 seconds, or the video stalls for 30, the
+next server takes over from the same position. The Server button offers “Automatic” (the default)
+or pinning one server to be tried first.
+
+To see how each server does on a device, start a title with one server only and read the log:
+
+```bash
+adb shell am start -n com.vidbox.tv/.VbDetailActivity --el id 27205 --es type movie --ez play true --es probe 0
+adb logcat -s Vidbox
+```
+
+`probe` is the server's index in `Vb.SERVERS`; the log says `PROBE 0 OK …` or `PROBE 0 FAIL …`.
+
+## Build and install
+
+Needs the Android SDK build-tools and platform, JDK 17, and `adb`.
+
 ```bash
 scripts/build.sh
 ```
-Output: `build/VidboxTV.apk` (Signed with local debug keystore in `keystore/`).
 
-### Build and Sideload to Android TV / Chromecast
-Connect your Android TV via adb (e.g. `adb connect 192.168.1.xxx:5555`):
+The result is `build/VidboxTV.apk`, version `dev`, signed with `keystore/debug.jks` (created on
+the first build, not in git).
+
 ```bash
-scripts/build.sh --install
+adb install -r -i com.vidbox.tv build/VidboxTV.apk
 ```
 
----
+`-i com.vidbox.tv` records the app as its own installer, which is what lets it update itself
+without a confirmation.
 
-## Companion Web Portal
+## Releases and self-update
 
-Run the companion website locally:
+Every push to `main` runs `.github/workflows/build-apk.yml`: it builds version `1.0.<run>`
+(versionCode `1000 + run`), publishes the APK to the `latest` release, then commits `version.json`.
+While it runs, the commit carries a “build progress” status with a percentage and the time left.
+
+The build is signed with the key in the repository secrets `VB_KEYSTORE_BASE64`,
+`VB_KEYSTORE_PASSWORD`, `VB_KEY_ALIAS` and `VB_KEY_PASSWORD`. Android only installs an update
+signed with the same key as the copy it replaces, so without those secrets the workflow signs with
+a throwaway key and warns that the build cannot update an installed app.
+
+The app reads `version.json` from `main` each time its main screen comes to the front (at most
+every three minutes). When it names a newer build the app downloads and installs it without
+asking, and only while the main screen is in front, never during a film. The app closes for the
+install and opens again. A local `dev` build never updates itself.
+
+## Icon and TV tile
+
+Same look as the owner's other TV apps: the name in white Helvetica Bold on a navy gradient over a
+cyan bar. Redraw them with:
+
+```bash
+swift scripts/make-icons.swift
+```
+
+## Companion web portal
+
 ```bash
 python3 web/server.py 8080
 ```
-Open [http://localhost:8080](http://localhost:8080) in your browser.
+
+Then open <http://localhost:8080>.

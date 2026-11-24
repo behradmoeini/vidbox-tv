@@ -14,6 +14,13 @@ concurrency:
 
 permissions:
   contents: write
+  # For the "build progress" status on the commit (.github/scripts/progress.sh): how far the build
+  # is and about how long it has left, read from how long the last successful runs took.
+  statuses: write
+  actions: read
+
+env:
+  GH_TOKEN: ${{ github.token }}
 
 jobs:
   build:
@@ -34,6 +41,7 @@ jobs:
 
       - name: Setup Android SDK Build Tools
         run: |
+          .github/scripts/progress.sh at 5 "Setting up"
           echo "ANDROID_HOME=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
           BT_DIR="$(ls -d "$ANDROID_SDK_ROOT"/build-tools/* | sort -V | tail -1)"
           echo "ANDROID_BUILD_TOOLS=$BT_DIR" >> "$GITHUB_ENV"
@@ -55,7 +63,10 @@ jobs:
             echo "VB_KEY_PASS=${VB_KEY_PASSWORD:-android}" >> "$GITHUB_ENV"
             echo "Restored custom signing key from secrets."
           else
-            # Generate deterministic signing keystore for CI builds
+            # No signing key in the repo's secrets: sign with a throwaway key so the build still
+            # produces an APK. Android refuses to install it over a copy signed with another key,
+            # so such a build cannot update an installed app.
+            echo "::warning::VB_KEYSTORE_BASE64 is not set: this APK is signed with a throwaway key and cannot update an installed copy."
             keytool -genkeypair -keystore keystore/ci-release.jks -storepass vidbox_release_2026 \
               -keypass vidbox_release_2026 -alias vidbox -keyalg RSA -keysize 2048 -validity 10000 \
               -dname "CN=Vidbox TV, O=Vidbox, C=US"
@@ -72,9 +83,8 @@ jobs:
           VC=$((1000 + GITHUB_RUN_NUMBER))
           VN="1.0.${GITHUB_RUN_NUMBER}"
           echo "Building versionCode $VC ($VN)..."
-          
+          .github/scripts/progress.sh at 30 "Building Vidbox TV"
           VC="$VC" VN="$VN" ./scripts/build.sh
-          
           ls -lh build/VidboxTV.apk
           echo "vc=$VC" >> "$GITHUB_OUTPUT"
           echo "vn=$VN" >> "$GITHUB_OUTPUT"
@@ -91,20 +101,9 @@ jobs:
           EOF
           cat version.json
 
-      - name: Commit version.json to main
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add version.json
-          if ! git diff --staged --quiet; then
-            git commit -m "Update version manifest to v${{ steps.build_apk.outputs.vn }} [skip ci]"
-            git push origin main
-          fi
-
       - name: Publish to GitHub Releases (Public)
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
+          .github/scripts/progress.sh at 70 "Publishing"
           # Delete previous 'latest' release and recreate with fresh APK
           gh release delete latest --yes --cleanup-tag 2>/dev/null || true
           
@@ -125,3 +124,22 @@ jobs:
           gh release create "$TAG" build/VidboxTV.apk version.json \
             --title "Vidbox TV $TAG" \
             --notes "Release $TAG (versionCode ${{ steps.build_apk.outputs.vc }})."
+
+      # After the release, so the app never reads a manifest that points at an APK not yet published.
+      - name: Commit version.json to main
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add version.json
+          if ! git diff --staged --quiet; then
+            git commit -m "Update version manifest to v${{ steps.build_apk.outputs.vn }} [skip ci]"
+            git pull -q --rebase origin main
+            git push origin main
+          fi
+
+      - name: Report the finished build
+        run: .github/scripts/progress.sh done
+
+      - name: Report a failed build
+        if: failure()
+        run: .github/scripts/progress.sh failed

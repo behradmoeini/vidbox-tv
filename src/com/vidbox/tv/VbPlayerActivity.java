@@ -2,19 +2,21 @@ package com.vidbox.tv;
 
 import android.app.Activity;
 import android.app.AlertDialog;
-import android.graphics.Bitmap;
+import android.content.Context;
+import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.Paint;
+import android.graphics.RectF;
 import android.graphics.drawable.ColorDrawable;
 import android.net.Uri;
 import android.os.Bundle;
-import android.os.Handler;
-import android.os.Looper;
+import android.os.SystemClock;
+import android.util.Log;
 import android.view.Gravity;
 import android.view.KeyEvent;
+import android.view.MotionEvent;
 import android.view.View;
-import android.view.ViewGroup;
 import android.view.WindowManager;
-import android.webkit.ConsoleMessage;
 import android.webkit.CookieManager;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceRequest;
@@ -26,507 +28,741 @@ import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.TextView;
-import android.widget.Toast;
 
 import org.json.JSONObject;
 
 import java.io.ByteArrayInputStream;
-import java.util.Arrays;
-import java.util.HashSet;
-import java.util.Set;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
- * Fullscreen hardware-accelerated streaming player for Android TV.
+ * Full-screen player.
  *
- * Renders Vidbox server embeds (Echo, Max, 4K, Vidfast, V2, Vidpro, Premium, Nxsha, etc.)
- * in a high-performance TV-optimized WebView with remote D-pad controls, ad-blocking,
- * auto next-episode, and watch progress tracking.
+ * The stream servers are web pages with their own players, made for a mouse: left to themselves
+ * they sit paused and muted waiting for a click, and open adverts. So the page is opened out of
+ * sight in a WebView; once its video element has a film in it, the picture alone is shown
+ * full-screen and that element is driven from here (play, pause, seek, speed). The controls on
+ * screen are this app's own and the remote never reaches the page.
+ *
+ * A server whose page has no video within {@link #FIND_MS} is skipped for the next one, and how
+ * each server did is remembered ({@link Vb#serverResult}), so the next film starts with the one
+ * that is working best right now.
+ *
+ * Remote: Left/Right seek (faster when held), OK play/pause. Down opens the button row: previous
+ * episode, back 10 s, play/pause, forward 10 s, next episode, speed, server. Up or Back leaves it.
  */
 public class VbPlayerActivity extends Activity {
+    private static final String TAG = "Vidbox";
+    private static final long FIND_MS = 40_000, STALL_MS = 30_000;
+    private static final float[] SPEEDS = {0.5f, 0.75f, 1f, 1.25f, 1.5f, 2f};
+
+    /** Advertising hosts the server pages load; refused so they cost no time. */
+    private static final String[] BLOCKED = {
+            "doubleclick.net", "googlesyndication.com", "google-analytics.com", "googletagmanager.com",
+            "adsterra", "popads.net", "propellerads", "exoclick.com", "juicyads.com", "clickadu.com",
+            "popcash.net", "hilltopads", "trafficjunky.com", "monetag.com", "adkeeper", "onclickads",
+            "histats.com", "disqus.com", "facebook.net", "cloudflareinsights.com"};
+
     private Vb.Item item;
-    private String type;
-    private long tmdbId;
-    private String imdbId;
-    private int season = 1;
-    private int episode = 1;
-    private String title = "";
-    private int currentServerIdx = 0;
-    private long resumePosition = 0;
+    private String imdbId, probe, probeFlags = "";
+    private int season, episode;
+    private int[] seasonNumbers, seasonCounts;
 
-    private FrameLayout rootLayout;
-    private WebView webView;
-    private FrameLayout customViewContainer;
-    private WebChromeClient.CustomViewCallback customViewCallback;
-    private View customView;
+    // The server's page
+    private WebView web;
+    private FrameLayout webHolder;
+    private View cover;
+    private final List<Integer> order = new ArrayList<>(); // servers still to try, in order
+    private int serverIdx = -1;
+    private long findStarted;
+    private boolean webPaused, webEnded;
+    private long webPos, webDur, webBuffered;
 
-    private ProgressBar loadingSpinner;
-    private TextView seekOsd;
-    private LinearLayout controlHud;
-    private TextView hudTitle;
-    private TextView hudServerBtn;
-    private TextView hudPrevBtn;
-    private TextView hudNextBtn;
-    private TextView hudReloadBtn;
+    private boolean prepared, failed, started;
+    private int generation, retries;
+    private long resumeAt, lastPos, duration, seekTarget = -1, waitingSince, lastSave;
 
-    private final Handler handler = new Handler(Looper.getMainLooper());
-    private final Runnable hideHudRunnable = this::hideHud;
-    private final Runnable hideSeekOsdRunnable = () -> seekOsd.setVisibility(View.GONE);
-    private boolean isHudVisible = false;
+    private FrameLayout root;
+    private View overlay;
+    private TextView title, now, total, center, playBtn, speedBtn, serverBtn;
+    private LinearLayout buttons;
+    private float speed = 1f;
+    private ProgressBar spinner;
+    private Bar bar;
 
-    // Periodic progress saver
-    private final Runnable progressCheckRunnable = new Runnable() {
+    private final Runnable hide = () -> {
+        if (playing() && seekTarget < 0) {
+            if (buttons.hasFocus()) root.requestFocus();
+            overlay.setVisibility(View.INVISIBLE);
+        }
+    };
+    private final Runnable commitSeek = this::commitSeek;
+    private final Runnable tick = new Runnable() {
         @Override
         public void run() {
-            queryProgress();
-            handler.postDelayed(this, 5000);
+            onTick();
+            Vb.MAIN.postDelayed(this, 500);
         }
     };
 
-    // Known ad & popunder hosts to block on TV
-    private static final Set<String> BLOCKED_HOSTS = new HashSet<>(Arrays.asList(
-            "adsterra.com", "popads.net", "propellerads.com", "doubleclick.net",
-            "googleads.g.doubleclick.net", "exoclick.com", "bet365", "1xbet",
-            "adkeeper.co.uk", "juicyads.com", "clickadu.com", "popcash.net",
-            "hilltopads.com", "trafficjunky.com", "monetag.com"
-    ));
-
     @Override
-    protected void onCreate(Bundle savedInstanceState) {
-        super.onCreate(savedInstanceState);
+    protected void onCreate(Bundle b) {
+        super.onCreate(b);
         Vb.init(this);
-
-        getWindow().addFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN | WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        getWindow().setBackgroundDrawable(new ColorDrawable(Color.BLACK));
-
-        // Read extras
-        tmdbId = getIntent().getLongExtra("id", 0);
-        type = getIntent().getStringExtra("type");
-        title = getIntent().getStringExtra("title");
+        try {
+            item = Vb.Item.fromJson(new JSONObject(getIntent().getStringExtra("item_json")));
+        } catch (Exception e) {
+            finish();
+            return;
+        }
         imdbId = getIntent().getStringExtra("imdb_id");
+        probe = getIntent().getStringExtra("probe");
+        if (probe != null) {
+            probeFlags = probe.replaceAll("[0-9]", "");
+            probe = probe.replaceAll("[^0-9]", "");
+        }
         season = getIntent().getIntExtra("season", 1);
         episode = getIntent().getIntExtra("episode", 1);
-        resumePosition = getIntent().getLongExtra("resume_pos", 0);
-        String serverName = getIntent().getStringExtra("server_name");
-
-        String itemJson = getIntent().getStringExtra("item_json");
-        if (itemJson != null) {
-            try {
-                item = Vb.Item.fromJson(new JSONObject(itemJson));
-            } catch (Exception ignored) {}
-        }
-        if (item == null) {
-            item = new Vb.Item();
-            item.id = tmdbId;
-            item.type = type != null ? type : Vb.TYPE_MOVIE;
-            item.title = title != null ? title : "Title";
+        seasonNumbers = getIntent().getIntArrayExtra("season_numbers");
+        seasonCounts = getIntent().getIntArrayExtra("season_counts");
+        if (b != null) {
+            season = b.getInt("season", season);
+            episode = b.getInt("episode", episode);
+        } else if (getIntent().getBooleanExtra("startOver", false)) {
+            Vb.clearPosition(key());
         }
 
-        // Find server index
-        if (serverName != null) {
-            for (int i = 0; i < Vb.SERVERS.size(); i++) {
-                if (Vb.SERVERS.get(i).name.equals(serverName)) {
-                    currentServerIdx = i;
-                    break;
-                }
-            }
-        }
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON | WindowManager.LayoutParams.FLAG_FULLSCREEN);
+        getWindow().setBackgroundDrawable(new ColorDrawable(Color.BLACK));
+        setVolumeControlStream(android.media.AudioManager.STREAM_MUSIC);
+        speed = Vb.prefs().getFloat("speed", 1f);
 
-        buildPlayerView();
-        loadCurrentStream();
-        handler.postDelayed(progressCheckRunnable, 5000);
+        root = new FrameLayout(this);
+        root.setFocusable(true);
+        root.setBackgroundColor(Color.BLACK);
+        // The server's page, underneath everything: it has to be laid out and "visible" to run, but
+        // it is never seen (the black cover is on top of it) and never gets the remote's keys.
+        webHolder = new FrameLayout(this);
+        webHolder.setDescendantFocusability(FrameLayout.FOCUS_BLOCK_DESCENDANTS);
+        root.addView(webHolder, new FrameLayout.LayoutParams(-1, -1));
+        cover = new View(this);
+        cover.setBackgroundColor(Color.BLACK);
+        root.addView(cover, new FrameLayout.LayoutParams(-1, -1));
+
+        spinner = new ProgressBar(this);
+        root.addView(spinner, new FrameLayout.LayoutParams(VbUi.dp(this, 56), VbUi.dp(this, 56), Gravity.CENTER));
+
+        center = VbUi.label(this, "", 20, Color.WHITE, true);
+        center.setGravity(Gravity.CENTER);
+        center.setPadding(VbUi.dp(this, 20), VbUi.dp(this, 10), VbUi.dp(this, 20), VbUi.dp(this, 10));
+        center.setBackground(VbUi.round(0xD0000000, VbUi.dp(this, 12), 0, 0));
+        center.setVisibility(View.GONE);
+        FrameLayout.LayoutParams cl = new FrameLayout.LayoutParams(-2, -2, Gravity.CENTER);
+        cl.topMargin = VbUi.dp(this, 90);
+        root.addView(center, cl);
+
+        // Controls: title on top, progress and buttons at the bottom, each on a flat dark band.
+        FrameLayout ov = new FrameLayout(this);
+        title = VbUi.label(this, "", 20, Color.WHITE, true);
+        title.setSingleLine(true);
+        title.setPadding(VbUi.dp(this, 40), VbUi.dp(this, 24), VbUi.dp(this, 40), VbUi.dp(this, 16));
+        title.setBackgroundColor(0xB0000000);
+        ov.addView(title, new FrameLayout.LayoutParams(-1, -2, Gravity.TOP));
+
+        LinearLayout bottom = new LinearLayout(this);
+        bottom.setOrientation(LinearLayout.VERTICAL);
+        bottom.setBackgroundColor(0xB0000000);
+        bottom.setPadding(VbUi.dp(this, 40), VbUi.dp(this, 14), VbUi.dp(this, 40), VbUi.dp(this, 24));
+        LinearLayout line = new LinearLayout(this);
+        line.setGravity(Gravity.CENTER_VERTICAL);
+        now = VbUi.label(this, "0:00", 15, Color.WHITE, false);
+        total = VbUi.label(this, "", 15, VbUi.DIM, false);
+        bar = new Bar(this);
+        line.addView(now, new LinearLayout.LayoutParams(VbUi.dp(this, 76), -2));
+        line.addView(bar, new LinearLayout.LayoutParams(0, VbUi.dp(this, 22), 1f));
+        total.setGravity(Gravity.END);
+        line.addView(total, new LinearLayout.LayoutParams(VbUi.dp(this, 76), -2));
+        bottom.addView(line);
+        buttons = new LinearLayout(this);
+        buttons.setGravity(Gravity.CENTER_VERTICAL);
+        boolean series = Vb.TYPE_TV.equals(item.type);
+        if (series) button("Previous episode", v -> jump(-1));
+        button("−10 s", v -> nudge(-1, 0));
+        playBtn = button("Pause", v -> toggle());
+        button("+10 s", v -> nudge(1, 0));
+        if (series) button("Next episode", v -> jump(1));
+        buttons.addView(new View(this), new LinearLayout.LayoutParams(0, 1, 1f));
+        speedBtn = button("", v -> nextSpeed());
+        serverBtn = button("", v -> pickServer());
+        bottom.addView(buttons, VbUi.lp(-1, -2, 0, VbUi.dp(this, 10), 0, 0));
+        ov.addView(bottom, new FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM));
+        overlay = ov;
+        root.addView(ov, new FrameLayout.LayoutParams(-1, -1));
+        setContentView(root);
+        root.requestFocus();
     }
 
     @Override
-    protected void onDestroy() {
-        super.onDestroy();
-        handler.removeCallbacksAndMessages(null);
-        if (webView != null) {
-            webView.stopLoading();
-            webView.destroy();
-        }
+    protected void onSaveInstanceState(Bundle out) {
+        super.onSaveInstanceState(out);
+        out.putInt("season", season);
+        out.putInt("episode", episode);
     }
 
-    // ---------------------------------------------------------------- Player View Setup
+    @Override
+    protected void onStart() {
+        super.onStart();
+        if (item == null) return;
+        begin();
+        Vb.MAIN.post(tick);
+    }
 
-    private void buildPlayerView() {
-        rootLayout = new FrameLayout(this);
-        rootLayout.setBackgroundColor(Color.BLACK);
-        setContentView(rootLayout);
+    @Override
+    protected void onStop() {
+        super.onStop();
+        Vb.MAIN.removeCallbacks(tick);
+        Vb.MAIN.removeCallbacks(hide);
+        Vb.MAIN.removeCallbacks(commitSeek);
+        save();
+        generation++;
+        prepared = false;
+        closePage(); // also what stops the sound
+    }
 
-        // 1. Hardware Accelerated TV WebView
-        webView = new WebView(this);
-        webView.setLayoutParams(new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-        webView.setBackgroundColor(Color.BLACK);
+    private String key() {
+        return Vb.playKey(item.type, item.id, season, episode);
+    }
 
-        WebSettings s = webView.getSettings();
+    private String heading() {
+        return Vb.TYPE_TV.equals(item.type) ? item.title + "  ·  Season " + season + " Episode " + episode : item.title;
+    }
+
+    // ---------------------------------------------------------------- finding the stream
+
+    /** Start this film or episode from scratch: the preferred server first, then the others in order. */
+    private void begin() {
+        order.clear();
+        if (probe != null) order.add(Integer.parseInt(probe)); // testing one server: no fallback
+        else order.addAll(Vb.serverOrder());
+        retries = 0;
+        failed = false;
+        Vb.touchRecent(item, season, episode);
+        long saved = Vb.position(key());
+        resumeAt = Math.max(saved, 0);
+        lastPos = resumeAt;
+        title.setText(heading());
+        nextServer(null);
+    }
+
+    /** Try the next server in the list, or give up if there is none left. */
+    private void nextServer(String why) {
+        if (why != null && serverIdx >= 0 && probe == null) Vb.serverResult(serverIdx, false, 0);
+        if (why != null) Log.i(TAG, "server " + (serverIdx < 0 ? "?" : Vb.SERVERS.get(serverIdx).name) + " skipped: " + why);
+        if (probe != null && why != null) Log.i(TAG, "PROBE " + probe + " FAIL " + why);
+        if (order.isEmpty()) {
+            failed = true;
+            prepared = false;
+            generation++;
+            closePage();
+            spinner.setVisibility(View.GONE);
+            say("None of the servers has this title right now.\nOK to try again  ·  Back to leave");
+            showControls();
+            return;
+        }
+        serverIdx = order.remove(0);
+        find();
+    }
+
+    /** Open the current server's page out of sight and wait for its player to ask for a stream. */
+    private void find() {
+        final int gen = ++generation;
+        final Vb.Server server = Vb.SERVERS.get(serverIdx);
+        prepared = false;
+        started = false;
+        seekTarget = -1;
+        duration = 0;
+        webBuffered = 0;
+        webPaused = false;
+        webEnded = false;
+        webPos = webDur = 0;
+        // Testing one server ("probe"): leave the page uncovered so a screenshot shows what it is doing.
+        cover.setVisibility(probe != null && !probeFlags.contains("c") ? View.GONE : View.VISIBLE);
+        waitingSince = 0;
+        findStarted = System.currentTimeMillis();
+        center.setVisibility(View.GONE);
+        spinner.setVisibility(View.VISIBLE);
+        say("Finding the stream  ·  " + server.name);
+        updateButtons();
+        showControls();
+        closePage();
+
+        final String pageUrl = server.buildUrl(item.type, item.id, imdbId, season, episode);
+        final String pageHost = Uri.parse(pageUrl).getHost();
+        Log.i(TAG, "find: " + server.name + " " + pageUrl);
+        web = new WebView(this);
+        WebSettings s = web.getSettings();
         s.setJavaScriptEnabled(true);
         s.setDomStorageEnabled(true);
-        s.setDatabaseEnabled(true);
         s.setMediaPlaybackRequiresUserGesture(false);
         s.setUserAgentString(Vb.UA);
-        s.setAllowFileAccess(true);
-        s.setAllowContentAccess(true);
-        s.setSupportMultipleWindows(false);
-        s.setLoadWithOverviewMode(true);
-        s.setUseWideViewPort(true);
-
+        s.setSupportMultipleWindows(true); // so that pop-ups come to onCreateWindow, where they are refused
+        s.setJavaScriptCanOpenWindowsAutomatically(false);
         CookieManager.getInstance().setAcceptCookie(true);
-        CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true);
-
-        // ChromeClient for fullscreen video
-        webView.setWebChromeClient(new WebChromeClient() {
+        CookieManager.getInstance().setAcceptThirdPartyCookies(web, true);
+        web.setWebChromeClient(new WebChromeClient() {
             @Override
-            public void onShowCustomView(View view, CustomViewCallback callback) {
-                if (customView != null) {
-                    callback.onCustomViewHidden();
-                    return;
-                }
-                customView = view;
-                customViewCallback = callback;
-                webView.setVisibility(View.GONE);
-                customViewContainer.addView(view, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-                customViewContainer.setVisibility(View.VISIBLE);
-            }
-
-            @Override
-            public void onHideCustomView() {
-                if (customView == null) return;
-                webView.setVisibility(View.VISIBLE);
-                customViewContainer.setVisibility(View.GONE);
-                customViewContainer.removeView(customView);
-                if (customViewCallback != null) customViewCallback.onCustomViewHidden();
-                customView = null;
-                customViewCallback = null;
-            }
-
-            @Override
-            public boolean onConsoleMessage(ConsoleMessage cm) {
-                return true;
+            public boolean onCreateWindow(WebView view, boolean dialog, boolean gesture, android.os.Message msg) {
+                return false; // advertising pop-up
             }
         });
-
-        // WebViewClient with ad-blocking and styling injection
-        webView.setWebViewClient(new WebViewClient() {
+        web.setWebViewClient(new WebViewClient() {
             @Override
-            public void onPageStarted(WebView view, String url, Bitmap favicon) {
-                loadingSpinner.setVisibility(View.VISIBLE);
-            }
-
-            @Override
-            public void onPageFinished(WebView view, String url) {
-                loadingSpinner.setVisibility(View.GONE);
-                injectTvOptimizationStyles();
+            public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest req) {
+                // The page may only move within its own site; anything else is an advert taking over.
+                if (!req.isForMainFrame()) return false;
+                String h = req.getUrl().getHost();
+                boolean same = h != null && pageHost != null && (h.equals(pageHost) || h.endsWith("." + root(pageHost)) || h.equals(root(pageHost)));
+                if (!same) Log.i(TAG, "blocked navigation to " + h);
+                return !same;
             }
 
             @Override
             public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest req) {
+                // Not the main thread. Every request of the page and its frames passes here.
                 Uri uri = req.getUrl();
-                String host = uri.getHost();
-                if (host != null) {
-                    String h = host.toLowerCase();
-                    for (String blocked : BLOCKED_HOSTS) {
-                        if (h.contains(blocked)) {
-                            // Block ad request
-                            return new WebResourceResponse("text/plain", "UTF-8", new ByteArrayInputStream(new byte[0]));
+                String host = uri.getHost() == null ? "" : uri.getHost().toLowerCase();
+                for (String bad : BLOCKED) {
+                    if (host.contains(bad)) {
+                        return new WebResourceResponse("text/plain", "UTF-8", new ByteArrayInputStream(new byte[0]));
+                    }
+                }
+                return null;
+            }
+        });
+        webHolder.addView(web, new FrameLayout.LayoutParams(-1, -1));
+        web.loadUrl(pageUrl);
+
+        // Many of these players wait for a click before they load anything.
+        for (int k = 0; k < 5; k++) {
+            Vb.MAIN.postDelayed(() -> {
+                if (gen == generation && !prepared) tap();
+            }, 4000 + k * 4000L);
+        }
+        Vb.MAIN.postDelayed(() -> {
+            if (gen == generation && !prepared) nextServer("no video in " + FIND_MS / 1000 + " s");
+        }, FIND_MS);
+        pollPage(gen);
+    }
+
+    /** What the page's own video element is doing: "readyState,duration,position,paused,ended,width,buffered". */
+    private static final String VIDEO_STATE = "(function(){var v=document.querySelector('video');"
+            + "if(!v||!isFinite(v.duration))return '';"
+            + "return [v.readyState,Math.floor(v.duration*1000),Math.floor(v.currentTime*1000),v.paused?1:0,v.ended?1:0,v.videoWidth,"
+            + "v.buffered.length?Math.floor(v.buffered.end(v.buffered.length-1)*1000):0].join(',')})()";
+
+    /** Ask the page every second, for as long as it is open, how its video is doing. */
+    private void pollPage(final int gen) {
+        if (gen != generation || web == null) return;
+        web.evaluateJavascript(VIDEO_STATE, res -> {
+            if (gen != generation || web == null) return;
+            if (probe != null && !prepared) Log.i(TAG, "page video state: " + res);
+            try {
+                String[] p = res.replace("\"", "").split(",");
+                if (p.length == 7) {
+                    int ready = Integer.parseInt(p[0]);
+                    webDur = Long.parseLong(p[1]);
+                    webPos = Long.parseLong(p[2]);
+                    webPaused = "1".equals(p[3]);
+                    webEnded = "1".equals(p[4]);
+                    webBuffered = Long.parseLong(p[6]);
+                    // Longer than two minutes: a film, not an advert in front of it.
+                    if (!prepared && ready >= 3 && webDur > 120_000 && Integer.parseInt(p[5]) > 0) showPage();
+                    if (prepared) {
+                        if (ready >= 3) {
+                            if (waitingSince != 0) spinner.setVisibility(View.GONE);
+                            waitingSince = 0;
+                        } else if (waitingSince == 0) {
+                            waitingSince = System.currentTimeMillis();
+                            spinner.setVisibility(View.VISIBLE);
                         }
                     }
                 }
-                return super.shouldInterceptRequest(view, req);
+            } catch (Exception ignored) {
             }
         });
-
-        rootLayout.addView(webView);
-
-        // 2. Custom View Container (for native fullscreen HTML5 video tag)
-        customViewContainer = new FrameLayout(this);
-        customViewContainer.setLayoutParams(new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-        customViewContainer.setBackgroundColor(Color.BLACK);
-        customViewContainer.setVisibility(View.GONE);
-        rootLayout.addView(customViewContainer);
-
-        // 3. Loading Spinner
-        loadingSpinner = new ProgressBar(this);
-        FrameLayout.LayoutParams spinLp = new FrameLayout.LayoutParams(VbUi.dp(this, 54), VbUi.dp(this, 54), Gravity.CENTER);
-        loadingSpinner.setLayoutParams(spinLp);
-        rootLayout.addView(loadingSpinner);
-
-        // 4. Seek OSD Feedback overlay
-        seekOsd = new TextView(this);
-        seekOsd.setTextColor(VbUi.TEXT_WHITE);
-        seekOsd.setTextSize(22);
-        seekOsd.setTypeface(null, android.graphics.Typeface.BOLD);
-        seekOsd.setPadding(VbUi.dp(this, 24), VbUi.dp(this, 12), VbUi.dp(this, 24), VbUi.dp(this, 12));
-        seekOsd.setBackground(VbUi.roundRect(0xCC090D16, VbUi.dp(this, 12), 0, 0));
-        seekOsd.setVisibility(View.GONE);
-        FrameLayout.LayoutParams seekLp = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER);
-        seekOsd.setLayoutParams(seekLp);
-        rootLayout.addView(seekOsd);
-
-        // 5. On-Screen Display Control HUD (Down arrow brings this up)
-        buildControlHud();
+        Vb.MAIN.postDelayed(() -> pollPage(gen), 1000);
     }
 
-    private void buildControlHud() {
-        controlHud = new LinearLayout(this);
-        controlHud.setOrientation(LinearLayout.VERTICAL);
-        controlHud.setPadding(VbUi.dp(this, 32), VbUi.dp(this, 16), VbUi.dp(this, 32), VbUi.dp(this, 20));
-        controlHud.setBackground(VbUi.gradientRect(0x00000000, 0xF0090D16, android.graphics.drawable.GradientDrawable.Orientation.TOP_BOTTOM, 0));
-        controlHud.setVisibility(View.GONE);
+    private void js(String code) {
+        if (web != null) web.evaluateJavascript("(function(){var v=document.querySelector('video');if(!v)return;" + code + "})()", null);
+    }
 
-        FrameLayout.LayoutParams hudLp = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM);
-        controlHud.setLayoutParams(hudLp);
+    /** The page's own video has started: uncover the page and take over its video element. */
+    private void showPage() {
+        prepared = true;
+        started = true;
+        duration = webDur;
+        long took = System.currentTimeMillis() - findStarted;
+        Log.i(TAG, "playing after " + took + " ms on " + Vb.SERVERS.get(serverIdx).name);
+        if (probe == null) Vb.serverResult(serverIdx, true, took);
+        // Only the picture: the page's own buttons are for a mouse.
+        web.evaluateJavascript("(function(){var v=document.querySelector('video');if(!v)return;"
+                + "var s=document.createElement('style');s.textContent='body *{visibility:hidden!important}video.vbx{visibility:visible!important;position:fixed!important;left:0!important;top:0!important;"
+                + "width:100vw!important;height:100vh!important;z-index:2147483647!important;background:#000!important;object-fit:contain!important}';"
+                + "document.head.appendChild(s);v.classList.add('vbx');v.controls=false;})()", null);
+        if (resumeAt > 0 && resumeAt < duration - 5000) js("v.currentTime=" + resumeAt / 1000.0 + ";");
+        js("v.muted=false;v.playbackRate=" + speed + ";v.play();");
+        cover.setVisibility(View.GONE);
+        spinner.setVisibility(View.GONE);
+        center.setVisibility(View.GONE);
+        updateButtons();
+        showControls();
+    }
 
-        // Title line
-        hudTitle = new TextView(this);
-        updateHudTitle();
-        hudTitle.setTextColor(VbUi.TEXT_WHITE);
-        hudTitle.setTextSize(18);
-        hudTitle.setTypeface(null, android.graphics.Typeface.BOLD);
-        hudTitle.setPadding(0, 0, 0, VbUi.dp(this, 10));
-        controlHud.addView(hudTitle);
+    private boolean playing() {
+        try {
+            return prepared && !webPaused;
+        } catch (Exception e) {
+            return false;
+        }
+    }
 
-        // Button row
-        LinearLayout btnRow = new LinearLayout(this);
-        btnRow.setOrientation(LinearLayout.HORIZONTAL);
-        btnRow.setGravity(Gravity.CENTER_VERTICAL);
+    /** "embed.example.co" -> "example.co" (good enough to keep a site's own sub-domains together). */
+    private static String root(String host) {
+        String[] p = host.split("\\.");
+        return p.length <= 2 ? host : p[p.length - 2] + "." + p[p.length - 1];
+    }
 
-        // Server switcher button
-        hudServerBtn = createHudButton("Server: " + Vb.SERVERS.get(currentServerIdx).name + " ▾");
-        hudServerBtn.setOnClickListener(v -> showServerPicker());
-        btnRow.addView(hudServerBtn);
+    /** A touch in the middle of the hidden page, where the play button is. */
+    private void tap() {
+        if (web == null || web.getWidth() == 0) return;
+        long t = SystemClock.uptimeMillis();
+        float x = web.getWidth() / 2f, y = web.getHeight() / 2f;
+        MotionEvent down = MotionEvent.obtain(t, t, MotionEvent.ACTION_DOWN, x, y, 0);
+        MotionEvent up = MotionEvent.obtain(t, t + 60, MotionEvent.ACTION_UP, x, y, 0);
+        web.dispatchTouchEvent(down);
+        web.dispatchTouchEvent(up);
+        down.recycle();
+        up.recycle();
+    }
 
-        // If TV show: Previous Episode & Next Episode buttons
-        if (Vb.TYPE_TV.equals(type)) {
-            hudPrevBtn = createHudButton("⏮ Prev Ep");
-            hudPrevBtn.setOnClickListener(v -> {
-                if (episode > 1) {
-                    episode--;
-                    updateHudTitle();
-                    loadCurrentStream();
-                } else {
-                    Toast.makeText(this, "First episode", Toast.LENGTH_SHORT).show();
+    private void closePage() {
+        if (web == null) return;
+        try {
+            web.stopLoading();
+            web.loadUrl("about:blank");
+            webHolder.removeView(web);
+            web.destroy();
+        } catch (Exception ignored) {
+        }
+        web = null;
+    }
+
+    /** The video stopped: ask the same server again from where it was, then move on to the next. */
+    private void playbackFailed(String why) {
+        if (failed) return;
+        Log.i(TAG, "playback failed (" + why + "), retry " + retries);
+        save();
+        prepared = false;
+        resumeAt = lastPos;
+        if (retries < 1) {
+            retries++;
+            find();
+            return;
+        }
+        retries = 0;
+        nextServer(why);
+    }
+
+    private void onCompletion() {
+        if (!prepared || failed) return;
+        webEnded = false;
+        // A dropped connection can surface as an early "completion": treat that as a stall.
+        if (duration > 0 && lastPos < duration - 20_000) {
+            playbackFailed("ended early");
+            return;
+        }
+        Vb.savePosition(key(), duration, duration);
+        if (!jump(1)) finish();
+    }
+
+    private void save() {
+        if (prepared && duration > 0 && item != null && lastPos > 0) Vb.savePosition(key(), lastPos, duration);
+    }
+
+    private void onTick() {
+        long nowMs = System.currentTimeMillis();
+        if (prepared) {
+            try {
+                long p = webPos;
+                if (webDur > 0) duration = webDur;
+                if (seekTarget < 0) {
+                    if (p != lastPos && playing()) {
+                        waitingSince = 0;
+                        if (retries > 0 && p > resumeAt + 15_000) retries = 0;
+                        if (probe != null && !probe.equals("done") && p > 3000) {
+                            Log.i(TAG, "PROBE " + probe + " OK pos=" + p + " dur=" + duration);
+                            probe = "done";
+                        }
+                    }
+                    lastPos = p;
                 }
-            });
-            btnRow.addView(hudPrevBtn);
-
-            hudNextBtn = createHudButton("Next Ep ⏭");
-            hudNextBtn.setOnClickListener(v -> {
-                episode++;
-                updateHudTitle();
-                loadCurrentStream();
-            });
-            btnRow.addView(hudNextBtn);
-        }
-
-        // Reload Stream button
-        hudReloadBtn = createHudButton("↻ Reload");
-        hudReloadBtn.setOnClickListener(v -> loadCurrentStream());
-        btnRow.addView(hudReloadBtn);
-
-        controlHud.addView(btnRow);
-        rootLayout.addView(controlHud);
-    }
-
-    private TextView createHudButton(String label) {
-        TextView btn = new TextView(this);
-        btn.setText(label);
-        btn.setTextColor(VbUi.TEXT_WHITE);
-        btn.setTextSize(14);
-        btn.setFocusable(true);
-        btn.setFocusableInTouchMode(true);
-        btn.setPadding(VbUi.dp(this, 16), VbUi.dp(this, 8), VbUi.dp(this, 16), VbUi.dp(this, 8));
-        btn.setBackground(VbUi.roundRect(VbUi.CARD_BG, VbUi.dp(this, 8), VbUi.dp(this, 1), 0x33FFFFFF));
-
-        btn.setOnFocusChangeListener((v, hasFocus) -> {
-            if (hasFocus) {
-                btn.setTextColor(0xFFFFFFFF);
-                btn.setBackground(VbUi.roundRect(VbUi.CARD_FOCUSED, VbUi.dp(this, 8), VbUi.dp(this, 2), VbUi.ACCENT));
-                VbUi.animateFocus(v, true, 1.06f);
-            } else {
-                btn.setTextColor(VbUi.TEXT_WHITE);
-                btn.setBackground(VbUi.roundRect(VbUi.CARD_BG, VbUi.dp(this, 8), VbUi.dp(this, 1), 0x33FFFFFF));
-                VbUi.animateFocus(v, false, 1.0f);
+            } catch (Exception ignored) {
             }
-        });
-
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        lp.setMargins(0, 0, VbUi.dp(this, 12), 0);
-        btn.setLayoutParams(lp);
-        return btn;
+            long shownPos = seekTarget >= 0 ? seekTarget : lastPos;
+            now.setText(Vb.time(shownPos));
+            total.setText(duration > 0 ? Vb.time(duration) : "");
+            bar.set(duration > 0 ? shownPos / (float) duration : 0, duration > 0 ? webBuffered / (float) duration : 0);
+            if (nowMs - lastSave > 5000) {
+                lastSave = nowMs;
+                save();
+            }
+            if (webEnded) onCompletion();
+        }
+        if (!failed && prepared && waitingSince > 0 && nowMs - waitingSince > STALL_MS) {
+            waitingSince = nowMs;
+            playbackFailed("stalled");
+        }
     }
 
-    private void updateHudTitle() {
-        if (hudTitle == null) return;
-        if (Vb.TYPE_TV.equals(type)) {
-            hudTitle.setText(String.format("%s — Season %d, Episode %d", title, season, episode));
+    // ---------------------------------------------------------------- controls
+
+    private TextView button(String label, View.OnClickListener click) {
+        TextView t = VbUi.pill(this, label);
+        t.setOnClickListener(click);
+        buttons.addView(t, VbUi.lp(-2, -2, 0, 0, VbUi.dp(this, 8), 0));
+        return t;
+    }
+
+    private void updateButtons() {
+        playBtn.setText(playing() || !prepared ? "Pause" : "Play");
+        String s = speed == Math.round(speed) ? String.valueOf(Math.round(speed)) : String.valueOf(speed);
+        speedBtn.setText("Speed " + s + "×");
+        serverBtn.setText("Server: " + (serverIdx < 0 ? "…" : Vb.SERVERS.get(serverIdx).name));
+    }
+
+    private void applySpeed() {
+        if (prepared) js("v.playbackRate=" + speed + ";");
+    }
+
+    private void nextSpeed() {
+        int i = 2;
+        for (int k = 0; k < SPEEDS.length; k++) if (Math.abs(SPEEDS[k] - speed) < 0.01f) i = k;
+        speed = SPEEDS[(i + 1) % SPEEDS.length];
+        Vb.prefs().edit().putFloat("speed", speed).apply();
+        applySpeed();
+        updateButtons();
+        showControls();
+    }
+
+    private void say(String s) {
+        center.setText(s);
+        center.setVisibility(View.VISIBLE);
+    }
+
+    private void showControls() {
+        overlay.setVisibility(View.VISIBLE);
+        Vb.MAIN.removeCallbacks(hide);
+        Vb.MAIN.postDelayed(hide, 4000);
+    }
+
+    private void toggle() {
+        if (failed) {
+            begin();
+            return;
+        }
+        if (!prepared) return;
+        if (playing()) {
+            js("v.pause();");
+            webPaused = true;
+            save();
+            say("Paused");
         } else {
-            hudTitle.setText(title);
+            js("v.play();");
+            webPaused = false;
+            center.setVisibility(View.GONE);
         }
+        updateButtons();
+        showControls();
     }
 
-    private void showHud() {
-        isHudVisible = true;
-        controlHud.setVisibility(View.VISIBLE);
-        hudServerBtn.requestFocus();
-        handler.removeCallbacks(hideHudRunnable);
-        handler.postDelayed(hideHudRunnable, 5000);
+    /** Accumulate D-pad presses into one seek; holding the key speeds it up. */
+    private void nudge(int dir, int repeat) {
+        if (!prepared || duration <= 0) return;
+        long step = repeat < 8 ? 10_000 : repeat < 25 ? 30_000 : 60_000;
+        if (seekTarget < 0) seekTarget = lastPos;
+        seekTarget = Math.max(0, Math.min(duration - 3000, seekTarget + dir * step));
+        long delta = seekTarget - lastPos;
+        say((delta >= 0 ? "+" : "−") + Vb.time(Math.abs(delta)) + "   →   " + Vb.time(seekTarget));
+        now.setText(Vb.time(seekTarget));
+        bar.set(seekTarget / (float) duration, webBuffered / (float) duration);
+        showControls();
+        Vb.MAIN.removeCallbacks(commitSeek);
+        Vb.MAIN.postDelayed(commitSeek, 450);
     }
 
-    private void hideHud() {
-        isHudVisible = false;
-        controlHud.setVisibility(View.GONE);
-        webView.requestFocus();
+    private void commitSeek() {
+        if (!prepared || seekTarget < 0) return;
+        js("v.currentTime=" + seekTarget / 1000.0 + ";");
+        lastPos = webPos = seekTarget;
+        seekTarget = -1;
+        center.setVisibility(View.GONE);
+        Vb.MAIN.postDelayed(hide, 4000);
     }
 
-    private void showServerPicker() {
-        String[] serverNames = new String[Vb.SERVERS.size()];
-        for (int i = 0; i < Vb.SERVERS.size(); i++) {
-            serverNames[i] = Vb.SERVERS.get(i).name;
-        }
-
-        new AlertDialog.Builder(this)
-                .setTitle("Switch Streaming Server")
-                .setSingleChoiceItems(serverNames, currentServerIdx, (dialog, which) -> {
-                    currentServerIdx = which;
-                    hudServerBtn.setText("Server: " + Vb.SERVERS.get(currentServerIdx).name + " ▾");
-                    loadCurrentStream();
-                    dialog.dismiss();
-                    hideHud();
+    private void pickServer() {
+        String[] names = new String[Vb.SERVERS.size()];
+        for (int i = 0; i < names.length; i++) names[i] = Vb.SERVERS.get(i).name;
+        new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                .setTitle("Play from")
+                .setSingleChoiceItems(names, Math.max(serverIdx, 0), (d, which) -> {
+                    d.dismiss();
+                    if (which == serverIdx && !failed) return;
+                    save();
+                    resumeAt = lastPos;
+                    failed = false;
+                    retries = 0;
+                    // The chosen one first; if it has nothing, carry on through the rest.
+                    order.clear();
+                    for (int i : Vb.serverOrder()) if (i != which) order.add(i);
+                    serverIdx = which;
+                    find();
                 })
-                .setNegativeButton("Cancel", null)
                 .show();
     }
 
-    // ---------------------------------------------------------------- Stream Loading
-
-    private void loadCurrentStream() {
-        Vb.Server server = Vb.SERVERS.get(currentServerIdx);
-        String streamUrl = server.buildUrl(type, tmdbId, imdbId, season, episode);
-
-        loadingSpinner.setVisibility(View.VISIBLE);
-        webView.loadUrl(streamUrl);
-
-        Toast.makeText(this, "Playing via " + server.name, Toast.LENGTH_SHORT).show();
+    /** Go to the next (+1) or previous (-1) episode, across seasons. False if there is none. */
+    private boolean jump(int by) {
+        if (!Vb.TYPE_TV.equals(item.type) || seasonNumbers == null) return false;
+        int si = -1;
+        for (int i = 0; i < seasonNumbers.length; i++) if (seasonNumbers[i] == season) si = i;
+        if (si < 0) return false;
+        int s = season, e = episode + by;
+        if (e < 1) {
+            if (si == 0) return false;
+            s = seasonNumbers[si - 1];
+            e = Math.max(seasonCounts[si - 1], 1);
+        } else if (e > seasonCounts[si]) {
+            if (si + 1 >= seasonNumbers.length) return false;
+            s = seasonNumbers[si + 1];
+            e = 1;
+        }
+        save();
+        season = s;
+        episode = e;
+        begin();
+        return true;
     }
-
-    private void injectTvOptimizationStyles() {
-        // Inject CSS to ensure video fits screen and unwanted ad overlays are hidden
-        String js = "javascript:(function() {" +
-                "  var style = document.createElement('style');" +
-                "  style.innerHTML = 'video { width: 100vw !important; height: 100vh !important; object-fit: contain !important; } " +
-                "  body, html { background: #000 !important; overflow: hidden !important; margin: 0 !important; padding: 0 !important; } " +
-                "  .ad-banner, .pop-under, [id*=\"banner\"], [class*=\"ad-\"] { display: none !important; }';" +
-                "  document.head.appendChild(style);" +
-                "  var v = document.querySelector('video');" +
-                "  if (v) { v.play().catch(function(){}); }" +
-                "})()";
-        webView.evaluateJavascript(js, null);
-    }
-
-    // ---------------------------------------------------------------- TV Remote Control
 
     @Override
-    public boolean onKeyDown(int keyCode, KeyEvent event) {
-        if (keyCode == KeyEvent.KEYCODE_DPAD_CENTER || keyCode == KeyEvent.KEYCODE_ENTER || keyCode == KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE) {
-            if (isHudVisible) {
-                return super.onKeyDown(keyCode, event);
-            }
-            togglePlayPause();
-            return true;
-        } else if (keyCode == KeyEvent.KEYCODE_DPAD_LEFT) {
-            if (!isHudVisible) {
-                seekRelative(-10);
-                return true;
-            }
-        } else if (keyCode == KeyEvent.KEYCODE_DPAD_RIGHT) {
-            if (!isHudVisible) {
-                seekRelative(10);
-                return true;
-            }
-        } else if (keyCode == KeyEvent.KEYCODE_DPAD_DOWN) {
-            if (!isHudVisible) {
-                showHud();
-                return true;
-            }
-        } else if (keyCode == KeyEvent.KEYCODE_DPAD_UP) {
-            if (isHudVisible) {
-                hideHud();
-                return true;
-            }
-        } else if (keyCode == KeyEvent.KEYCODE_BACK) {
-            if (isHudVisible) {
-                hideHud();
-                return true;
-            }
-            // Save progress and exit
-            queryProgress();
-            finish();
-            return true;
+    public boolean dispatchKeyEvent(KeyEvent e) {
+        // Any key keeps the controls up a little longer.
+        if (e.getAction() == KeyEvent.ACTION_DOWN && overlay != null && overlay.getVisibility() == View.VISIBLE) {
+            Vb.MAIN.removeCallbacks(hide);
+            Vb.MAIN.postDelayed(hide, 5000);
         }
-        return super.onKeyDown(keyCode, event);
+        return super.dispatchKeyEvent(e);
     }
 
-    private void togglePlayPause() {
-        String js = "javascript:(function() {" +
-                "  var v = document.querySelector('video');" +
-                "  if (v) { if (v.paused) { v.play(); return 'PLAYING'; } else { v.pause(); return 'PAUSED'; } }" +
-                "  return 'NO_VIDEO';" +
-                "})()";
-        webView.evaluateJavascript(js, res -> {
-            if (res != null && res.contains("PAUSED")) {
-                showSeekFeedback("⏸ Paused");
-            } else if (res != null && res.contains("PLAYING")) {
-                showSeekFeedback("▶ Playing");
+    @Override
+    public void onBackPressed() {
+        if (buttons != null && buttons.hasFocus()) {
+            root.requestFocus(); // first Back leaves the button row, the next one leaves the player
+            return;
+        }
+        super.onBackPressed();
+    }
+
+    @Override
+    public boolean onKeyDown(int code, KeyEvent e) {
+        if (buttons != null && buttons.hasFocus()) {
+            // In the button row Left/Right move between buttons (default focus handling) and OK
+            // presses the focused one; only Up and Down mean something here.
+            if (code == KeyEvent.KEYCODE_DPAD_UP) {
+                root.requestFocus();
+                return true;
             }
-        });
-    }
-
-    private void seekRelative(int seconds) {
-        String js = "javascript:(function() {" +
-                "  var v = document.querySelector('video');" +
-                "  if (v) { v.currentTime = Math.max(0, v.currentTime + (" + seconds + ")); return v.currentTime; }" +
-                "  return -1;" +
-                "})()";
-        webView.evaluateJavascript(js, res -> {
-            if (seconds > 0) {
-                showSeekFeedback("⏩ +" + seconds + "s");
-            } else {
-                showSeekFeedback("⏪ " + seconds + "s");
+            if (code == KeyEvent.KEYCODE_DPAD_DOWN) return true;
+            if (code == KeyEvent.KEYCODE_DPAD_LEFT || code == KeyEvent.KEYCODE_DPAD_RIGHT) {
+                // Move along the row and stop at its ends, so focus can never drop out into seeking.
+                View cur = buttons.getFocusedChild();
+                View next = cur == null ? null
+                        : cur.focusSearch(code == KeyEvent.KEYCODE_DPAD_LEFT ? View.FOCUS_LEFT : View.FOCUS_RIGHT);
+                if (next != null && next.getParent() == buttons) next.requestFocus();
+                return true;
             }
-        });
+            return super.onKeyDown(code, e);
+        }
+        switch (code) {
+            case KeyEvent.KEYCODE_DPAD_CENTER:
+            case KeyEvent.KEYCODE_ENTER:
+            case KeyEvent.KEYCODE_NUMPAD_ENTER:
+            case KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE:
+            case KeyEvent.KEYCODE_SPACE:
+                if (e.getRepeatCount() == 0) toggle();
+                return true;
+            case KeyEvent.KEYCODE_MEDIA_PLAY:
+                if (prepared && !playing()) toggle();
+                return true;
+            case KeyEvent.KEYCODE_MEDIA_PAUSE:
+                if (playing()) toggle();
+                return true;
+            case KeyEvent.KEYCODE_DPAD_LEFT:
+            case KeyEvent.KEYCODE_MEDIA_REWIND:
+                nudge(-1, e.getRepeatCount());
+                return true;
+            case KeyEvent.KEYCODE_DPAD_RIGHT:
+            case KeyEvent.KEYCODE_MEDIA_FAST_FORWARD:
+                nudge(1, e.getRepeatCount());
+                return true;
+            case KeyEvent.KEYCODE_DPAD_UP:
+                showControls();
+                return true;
+            case KeyEvent.KEYCODE_DPAD_DOWN:
+                showControls();
+                playBtn.requestFocus();
+                return true;
+            case KeyEvent.KEYCODE_MEDIA_NEXT:
+                jump(1);
+                return true;
+            case KeyEvent.KEYCODE_MEDIA_PREVIOUS:
+                jump(-1);
+                return true;
+            default:
+                return super.onKeyDown(code, e);
+        }
     }
 
-    private void showSeekFeedback(String text) {
-        seekOsd.setText(text);
-        seekOsd.setVisibility(View.VISIBLE);
-        handler.removeCallbacks(hideSeekOsdRunnable);
-        handler.postDelayed(hideSeekOsdRunnable, 1500);
-    }
+    /** Progress track: buffered part behind the played part. */
+    private static final class Bar extends View {
+        private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final RectF r = new RectF();
+        private float played, loaded;
 
-    private void queryProgress() {
-        String js = "(function() {" +
-                "  var v = document.querySelector('video');" +
-                "  if (v && v.duration > 0) {" +
-                "    return JSON.stringify({pos: Math.floor(v.currentTime * 1000), dur: Math.floor(v.duration * 1000)});" +
-                "  }" +
-                "  return null;" +
-                "})()";
-        webView.evaluateJavascript(js, val -> {
-            if (val != null && !val.equals("null")) {
-                try {
-                    // Strips potential quotes around returned JSON string
-                    String clean = val;
-                    if (clean.startsWith("\"") && clean.endsWith("\"")) {
-                        clean = clean.substring(1, clean.length() - 1).replace("\\\"", "\"");
-                    }
-                    JSONObject obj = new JSONObject(clean);
-                    long pos = obj.optLong("pos", 0);
-                    long dur = obj.optLong("dur", 0);
-                    if (pos > 0 && dur > 0) {
-                        Vb.saveProgress(item, season, episode, pos, dur);
-                    }
-                } catch (Exception ignored) {}
-            }
-        });
+        Bar(Context c) {
+            super(c);
+        }
+
+        void set(float p, float b) {
+            played = Math.max(0, Math.min(1, p));
+            loaded = Math.max(0, Math.min(1, b));
+            invalidate();
+        }
+
+        @Override
+        protected void onDraw(Canvas c) {
+            float h = getHeight(), w = getWidth(), t = h * 0.22f, cy = h / 2f;
+            r.set(0, cy - t / 2, w, cy + t / 2);
+            paint.setColor(0xFF3A3A42);
+            c.drawRoundRect(r, t, t, paint);
+            r.right = w * Math.max(loaded, played);
+            paint.setColor(0xFF77777F);
+            c.drawRoundRect(r, t, t, paint);
+            r.right = w * played;
+            paint.setColor(VbUi.ACCENT);
+            c.drawRoundRect(r, t, t, paint);
+            paint.setColor(Color.WHITE);
+            c.drawCircle(Math.max(h / 3, Math.min(w - h / 3, w * played)), cy, h / 3, paint);
+        }
     }
 }

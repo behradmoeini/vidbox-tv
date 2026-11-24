@@ -1,7 +1,6 @@
 package com.vidbox.tv;
 
 import android.app.Activity;
-import android.app.AlertDialog;
 import android.app.PendingIntent;
 import android.content.Intent;
 import android.content.pm.PackageInfo;
@@ -20,111 +19,93 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 
 /**
- * Self-update mechanism for Vidbox TV.
- * Checks for a new release manifest, prompts the user, downloads the APK,
- * and hands it to the system package installer.
+ * Self-update, with nothing for the viewer to do. Each time the main screen comes to the front the
+ * app reads the small manifest CI publishes ({@code version.json} on main); when it names a higher
+ * versionCode the APK is downloaded and installed straight away.
+ *
+ * Android installs it without asking when this app is its own installer of record and holds
+ * UPDATE_PACKAGES_WITHOUT_USER_ACTION (Android 12+). The first copy is sideloaded with
+ * {@code adb install -i com.vidbox.tv}, so that holds from the start; where it does not, the system
+ * shows its own confirmation once, and after that update this app is the installer of record.
+ * Replacing the app closes it, so the viewer is told and {@link VbUpdated} opens it again.
  */
 public final class VbUpdate {
-    public static String MANIFEST_URL = "https://raw.githubusercontent.com/behradmoeini/vidbox-tv-releases/main/version.json";
+    public static String MANIFEST_URL = "https://raw.githubusercontent.com/behradmoeini/vidbox-tv/main/version.json";
     private static final String STATUS = "com.vidbox.tv.INSTALL_STATUS";
-    private static final long EVERY_MS = 10 * 60_000L;
-    private static final long SNOOZE_MS = 60 * 60_000L;
+    private static final long EVERY_MS = 3 * 60_000L;    // at most one manifest read per 3 minutes
+    private static final long SNOOZE_MS = 60 * 60_000L;  // after a failed download or install
     private static long lastCheck, snoozedUntil;
-    private static AlertDialog prompt;
+    private static boolean busy;
 
     private VbUpdate() {}
 
     public static void check(final Activity a) {
+        // Called every time the main screen comes to the front. The app's process usually outlives
+        // the screen (Back does not kill it), so checking once per process would almost never run.
         long now = System.currentTimeMillis();
-        if (now - lastCheck < EVERY_MS || now < snoozedUntil) return;
-        if (prompt != null && prompt.isShowing()) return;
+        if (busy || now - lastCheck < EVERY_MS || now < snoozedUntil) return;
         lastCheck = now;
-
-        final long myCode;
+        final long mine;
         try {
             PackageInfo pi = a.getPackageManager().getPackageInfo(a.getPackageName(), 0);
-            if ("dev".equals(pi.versionName)) return; // skip for local dev builds
-            myCode = pi.versionCode;
+            if ("dev".equals(pi.versionName)) return; // local build: a release could not replace it anyway
+            mine = pi.versionCode;
         } catch (Exception e) {
             return;
         }
-
-        Vb.IO.execute(() -> {
+        busy = true;
+        Vb.async(() -> {
+            JSONObject m = new JSONObject(Vb.httpGetCached(MANIFEST_URL, 60_000L));
+            String url = m.optString("apk_url");
+            if (m.optLong("version_code", 0) <= mine || url.isEmpty()) return null;
+            final String name = m.optString("version_name", "");
+            Vb.MAIN.post(() -> Toast.makeText(a, "Getting Vidbox " + name + "…", Toast.LENGTH_LONG).show());
+            return download(a, url);
+        }, (apk, err) -> {
+            busy = false;
+            if (err != null) {
+                snoozedUntil = System.currentTimeMillis() + SNOOZE_MS;
+                return;
+            }
+            // Only while the main screen is still in front: never in the middle of a film.
+            if (apk == null || a.isFinishing() || a.isDestroyed() || !a.hasWindowFocus()) {
+                if (apk != null) lastCheck = 0; // ask again the next time the main screen opens
+                return;
+            }
             try {
-                String json = Vb.httpGetCached(MANIFEST_URL, 60_000L);
-                JSONObject m = new JSONObject(json);
-                final String url = m.optString("apk_url");
-                long remoteCode = m.optLong("version_code", 0);
-                String remoteName = m.optString("version_name", "latest");
-
-                if (remoteCode > myCode && !url.isEmpty()) {
-                    Vb.MAIN.post(() -> {
-                        if (a.isFinishing() || a.isDestroyed()) return;
-                        if (prompt != null && prompt.isShowing()) return;
-                        prompt = new AlertDialog.Builder(a, android.R.style.Theme_DeviceDefault_Dialog_Alert)
-                                .setTitle("Update Available")
-                                .setMessage("A new version of Vidbox TV (" + remoteName + ") is available. Install now?")
-                                .setPositiveButton("Update", (d, w) -> download(a, url))
-                                .setNegativeButton("Later", (d, w) -> snoozedUntil = System.currentTimeMillis() + SNOOZE_MS)
-                                .show();
-                    });
-                }
-            } catch (Exception ignored) {}
-        });
-    }
-
-    private static void download(final Activity a, final String url) {
-        final AlertDialog progress = new AlertDialog.Builder(a, android.R.style.Theme_DeviceDefault_Dialog_Alert)
-                .setTitle("Downloading Update")
-                .setMessage("0%")
-                .setCancelable(false)
-                .show();
-
-        Vb.IO.execute(() -> {
-            try {
-                File dir = new File(a.getCacheDir(), "update");
-                dir.mkdirs();
-                File out = new File(dir, "update.apk");
-                HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
-                c.setConnectTimeout(15_000);
-                c.setReadTimeout(30_000);
-                c.setRequestProperty("User-Agent", Vb.UA);
-                try (InputStream in = c.getInputStream(); OutputStream os = new FileOutputStream(out)) {
-                    long total = c.getContentLength();
-                    long done = 0;
-                    int lastPct = -1;
-                    byte[] buf = new byte[64 * 1024];
-                    int n;
-                    while ((n = in.read(buf)) > 0) {
-                        os.write(buf, 0, n);
-                        done += n;
-                        final int pct = total > 0 ? (int) (done * 100 / total) : -1;
-                        if (pct != lastPct) {
-                            lastPct = pct;
-                            Vb.MAIN.post(() -> progress.setMessage(pct < 0 ? "..." : pct + "%"));
-                        }
-                    }
-                } finally {
-                    c.disconnect();
-                }
-
-                install(a, out);
-                Vb.MAIN.post(() -> {
-                    try { progress.dismiss(); } catch (Exception ignored) {}
-                });
+                Toast.makeText(a, "Updating Vidbox. It closes for a moment and opens again.", Toast.LENGTH_LONG).show();
+                install(a, apk);
             } catch (Exception e) {
-                Vb.MAIN.post(() -> {
-                    try { progress.dismiss(); } catch (Exception ignored) {}
-                    Toast.makeText(a, "Update failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
-                });
+                snoozedUntil = System.currentTimeMillis() + SNOOZE_MS;
+                Toast.makeText(a, "Update failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
             }
         });
     }
 
+    private static File download(Activity a, String url) throws Exception {
+        File dir = new File(a.getCacheDir(), "update");
+        dir.mkdirs();
+        File out = new File(dir, "update.apk");
+        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+        c.setConnectTimeout(15_000);
+        c.setReadTimeout(30_000);
+        c.setRequestProperty("User-Agent", Vb.UA);
+        try (InputStream in = c.getInputStream(); OutputStream os = new FileOutputStream(out)) {
+            byte[] buf = new byte[64 * 1024];
+            for (int n; (n = in.read(buf)) > 0; ) os.write(buf, 0, n);
+        } finally {
+            c.disconnect();
+        }
+        return out;
+    }
+
     private static void install(Activity a, File apk) throws Exception {
         PackageInstaller installer = a.getPackageManager().getPackageInstaller();
-        int id = installer.createSession(
-                new PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL));
+        PackageInstaller.SessionParams params =
+                new PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL);
+        params.setAppPackageName(a.getPackageName());
+        if (Build.VERSION.SDK_INT >= 31) params.setRequireUserAction(PackageInstaller.SessionParams.USER_ACTION_NOT_REQUIRED);
+        int id = installer.createSession(params);
         try (PackageInstaller.Session s = installer.openSession(id)) {
             try (InputStream in = new FileInputStream(apk);
                  OutputStream os = s.openWrite("base.apk", 0, apk.length())) {
@@ -152,6 +133,7 @@ public final class VbUpdate {
                 }
             }
         } else if (st != PackageInstaller.STATUS_SUCCESS) {
+            snoozedUntil = System.currentTimeMillis() + SNOOZE_MS;
             String why = i.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE);
             Toast.makeText(a, "Update failed" + (why == null ? "" : ": " + why), Toast.LENGTH_LONG).show();
         }

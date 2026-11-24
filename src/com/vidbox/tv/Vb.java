@@ -203,6 +203,8 @@ public final class Vb {
                             s.seasonNumber = sNum;
                             s.name = sObj.optString("name", "Season " + sNum);
                             s.episodeCount = sObj.optInt("episode_count", 0);
+                            String aired = sObj.isNull("air_date") ? "" : sObj.optString("air_date", "");
+                            if (s.episodeCount == 0 || aired.isEmpty()) continue; // announced, not broadcast
                             d.seasons.add(s);
                         }
                     }
@@ -341,324 +343,294 @@ public final class Vb {
                     true)
     ));
 
-    // ---------------------------------------------------------------- API & catalog
+    // ---------------------------------------------------------------- background work
 
-    public interface Callback<T> {
-        void onSuccess(T result);
-        void onError(Exception e);
+    public interface Job<T> {
+        T run() throws Exception;
     }
 
-    public static final class HomeRow {
-        public final String title;
-        public final List<Item> items;
+    public interface Done<T> {
+        /** On the main thread: the result, or {@code null} and the error. */
+        void done(T result, Exception error);
+    }
 
-        public HomeRow(String title, List<Item> items) {
-            this.title = title;
-            this.items = items;
+    public static <T> void async(final Job<T> job, final Done<T> done) {
+        IO.execute(() -> {
+            T out = null;
+            Exception err = null;
+            try {
+                out = job.run();
+            } catch (Exception e) {
+                err = e;
+            }
+            final T o = out;
+            final Exception e = err;
+            MAIN.post(() -> done.done(o, e));
+        });
+    }
+
+    // ---------------------------------------------------------------- catalogue (TMDB)
+
+    public static final class Page {
+        public final List<Item> items = new ArrayList<>();
+        public int totalPages = 1;
+    }
+
+    private static String api(String path) {
+        return TMDB_API + path + (path.contains("?") ? "&" : "?") + "api_key=" + TMDB_KEY;
+    }
+
+    /** One page of a TMDB list, e.g. {@code /trending/movie/day} or {@code /discover/tv?with_genres=18}. */
+    public static Page list(String path, String type, int page) throws Exception {
+        JSONObject obj = new JSONObject(httpGetCached(api(path) + "&page=" + page, LIST_TTL));
+        Page out = new Page();
+        out.totalPages = Math.min(obj.optInt("total_pages", 1), 500); // TMDB serves no page past 500
+        JSONArray results = obj.optJSONArray("results");
+        for (int i = 0; results != null && i < results.length(); i++) {
+            JSONObject o = results.optJSONObject(i);
+            if (o == null) continue;
+            String t = type != null ? type : o.optString("media_type", "");
+            if (!TYPE_MOVIE.equals(t) && !TYPE_TV.equals(t)) continue; // search also returns people
+            Item it = Item.fromJson(o);
+            it.type = t;
+            if (it.poster != null && !it.poster.isEmpty()) out.items.add(it);
+        }
+        return out;
+    }
+
+    public static Page popular(String type, int page, int genreId) throws Exception {
+        return list("/discover/" + type + "?sort_by=popularity.desc" + (genreId > 0 ? "&with_genres=" + genreId : ""),
+                type, page);
+    }
+
+    public static Page search(String query, int page) throws Exception {
+        return list("/search/multi?query=" + URLEncoder.encode(query, "UTF-8"), null, page);
+    }
+
+    public static Detail detail(String type, long id) throws Exception {
+        String url = api("/" + type + "/" + id + "?append_to_response=external_ids,credits,recommendations,similar");
+        return Detail.fromJson(new JSONObject(httpGetCached(url, DETAIL_TTL)), type);
+    }
+
+    /** The episodes of one season that have already been broadcast. */
+    public static List<Episode> episodes(long tvId, int seasonNumber) throws Exception {
+        JSONObject obj = new JSONObject(httpGetCached(api("/tv/" + tvId + "/season/" + seasonNumber), DETAIL_TTL));
+        JSONArray arr = obj.optJSONArray("episodes");
+        String today = new java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US).format(new java.util.Date());
+        List<Episode> list = new ArrayList<>();
+        for (int i = 0; arr != null && i < arr.length(); i++) {
+            JSONObject o = arr.optJSONObject(i);
+            if (o == null) continue;
+            Episode ep = new Episode();
+            ep.id = o.optLong("id");
+            ep.seasonNumber = o.optInt("season_number", seasonNumber);
+            ep.episodeNumber = o.optInt("episode_number", i + 1);
+            ep.title = o.optString("name", "Episode " + ep.episodeNumber);
+            ep.overview = o.optString("overview", "");
+            ep.stillPath = o.optString("still_path", "");
+            ep.airDate = o.isNull("air_date") ? "" : o.optString("air_date", "");
+            if (ep.airDate.isEmpty() || ep.airDate.compareTo(today) > 0) continue;
+            list.add(ep);
+        }
+        return list;
+    }
+
+    public static List<Genre> genres(String type) throws Exception {
+        JSONObject obj = new JSONObject(httpGetCached(api("/genre/" + type + "/list"), GENRE_TTL));
+        JSONArray arr = obj.optJSONArray("genres");
+        List<Genre> list = new ArrayList<>();
+        for (int i = 0; arr != null && i < arr.length(); i++) {
+            JSONObject g = arr.optJSONObject(i);
+            if (g != null) list.add(new Genre(g.optInt("id"), g.optString("name")));
+        }
+        return list;
+    }
+
+    // ---------------------------------------------------------------- watch progress
+
+    public static SharedPreferences prefs() {
+        return prefs;
+    }
+
+    /** The key one film or one episode keeps its position under. */
+    public static String playKey(String type, long id, int season, int episode) {
+        return TYPE_TV.equals(type) ? "t" + id + "_" + season + "_" + episode : "m" + id;
+    }
+
+    /** Milliseconds watched; 0 if never started; -1 if watched to the end. */
+    public static long position(String key) {
+        return prefs == null ? 0 : prefs.getLong("pos_" + key, 0);
+    }
+
+    public static long duration(String key) {
+        return prefs == null ? 0 : prefs.getLong("dur_" + key, 0);
+    }
+
+    public static void savePosition(String key, long pos, long dur) {
+        if (prefs == null || dur <= 0) return;
+        boolean finished = pos >= dur - Math.max(60_000, dur / 20); // the credits count as the end
+        prefs.edit().putLong("pos_" + key, finished ? -1 : Math.max(pos, 1)).putLong("dur_" + key, dur).apply();
+    }
+
+    public static void clearPosition(String key) {
+        if (prefs != null) prefs.edit().remove("pos_" + key).apply();
+    }
+
+    /** Season and episode last played of a series, or null. */
+    public static int[] lastEpisode(long tvId) {
+        String s = prefs == null ? null : prefs.getString("last_" + tvId, null);
+        if (s == null) return null;
+        try {
+            String[] p = s.split("_");
+            return new int[]{Integer.parseInt(p[0]), Integer.parseInt(p[1])};
+        } catch (Exception e) {
+            return null;
         }
     }
 
-    /**
-     * Loads all Home screen rows: Continue Watching, Trending Movies, Trending TV,
-     * Now Playing, Netflix Originals, Amazon Prime, Apple TV+, Disney+, Top Rated.
-     */
-    public static void getHomeRows(Callback<List<HomeRow>> cb) {
-        IO.execute(() -> {
-            try {
-                List<HomeRow> rows = new ArrayList<>();
-
-                // 1. Continue Watching
-                List<Item> continueItems = getContinueWatching();
-                if (!continueItems.isEmpty()) {
-                    rows.add(new HomeRow("Continue Watching", continueItems));
-                }
-
-                // 2. Trending Movies
-                rows.add(new HomeRow("Trending Movies",
-                        fetchList(TMDB_API + "/trending/movie/day?api_key=" + TMDB_KEY, TYPE_MOVIE)));
-
-                // 3. Trending TV Shows
-                rows.add(new HomeRow("Trending TV Shows",
-                        fetchList(TMDB_API + "/trending/tv/day?api_key=" + TMDB_KEY, TYPE_TV)));
-
-                // 4. Now Playing
-                rows.add(new HomeRow("Now Playing in Theaters",
-                        fetchList(TMDB_API + "/movie/now_playing?api_key=" + TMDB_KEY, TYPE_MOVIE)));
-
-                // 5. Netflix Originals (Network ID 213)
-                rows.add(new HomeRow("Netflix Originals",
-                        fetchList(TMDB_API + "/discover/tv?api_key=" + TMDB_KEY + "&with_networks=213&sort_by=popularity.desc", TYPE_TV)));
-
-                // 6. Amazon Prime (Network ID 1024)
-                rows.add(new HomeRow("Amazon Prime Shows",
-                        fetchList(TMDB_API + "/discover/tv?api_key=" + TMDB_KEY + "&with_networks=1024&sort_by=popularity.desc", TYPE_TV)));
-
-                // 7. Apple TV+ (Network ID 2552)
-                rows.add(new HomeRow("Apple TV+ Shows",
-                        fetchList(TMDB_API + "/discover/tv?api_key=" + TMDB_KEY + "&with_networks=2552&sort_by=popularity.desc", TYPE_TV)));
-
-                // 8. Disney+ (Network ID 2739)
-                rows.add(new HomeRow("Disney+ Shows",
-                        fetchList(TMDB_API + "/discover/tv?api_key=" + TMDB_KEY + "&with_networks=2739&sort_by=popularity.desc", TYPE_TV)));
-
-                // 9. Top Rated Movies
-                rows.add(new HomeRow("Top Rated Movies",
-                        fetchList(TMDB_API + "/movie/top_rated?api_key=" + TMDB_KEY, TYPE_MOVIE)));
-
-                // 10. Top Rated TV Shows
-                rows.add(new HomeRow("Top Rated TV Shows",
-                        fetchList(TMDB_API + "/tv/top_rated?api_key=" + TMDB_KEY, TYPE_TV)));
-
-                MAIN.post(() -> cb.onSuccess(rows));
-            } catch (Exception e) {
-                MAIN.post(() -> cb.onError(e));
-            }
-        });
-    }
-
-    /**
-     * Browse Movies with pagination and optional genre filter.
-     */
-    public static void getMovies(int page, int genreId, Callback<List<Item>> cb) {
-        IO.execute(() -> {
-            try {
-                String url = TMDB_API + "/discover/movie?api_key=" + TMDB_KEY + "&page=" + page + "&sort_by=popularity.desc";
-                if (genreId > 0) url += "&with_genres=" + genreId;
-                List<Item> items = fetchList(url, TYPE_MOVIE);
-                MAIN.post(() -> cb.onSuccess(items));
-            } catch (Exception e) {
-                MAIN.post(() -> cb.onError(e));
-            }
-        });
-    }
-
-    /**
-     * Browse TV Shows with pagination and optional genre filter.
-     */
-    public static void getShows(int page, int genreId, Callback<List<Item>> cb) {
-        IO.execute(() -> {
-            try {
-                String url = TMDB_API + "/discover/tv?api_key=" + TMDB_KEY + "&page=" + page + "&sort_by=popularity.desc";
-                if (genreId > 0) url += "&with_genres=" + genreId;
-                List<Item> items = fetchList(url, TYPE_TV);
-                MAIN.post(() -> cb.onSuccess(items));
-            } catch (Exception e) {
-                MAIN.post(() -> cb.onError(e));
-            }
-        });
-    }
-
-    /**
-     * Search movies and TV shows across TMDB.
-     */
-    public static void search(String query, int page, Callback<List<Item>> cb) {
-        IO.execute(() -> {
-            try {
-                String encoded = URLEncoder.encode(query, "UTF-8");
-                String url = TMDB_API + "/search/multi?api_key=" + TMDB_KEY + "&query=" + encoded + "&page=" + page;
-                String json = httpGetCached(url, LIST_TTL);
-                JSONObject obj = new JSONObject(json);
-                JSONArray results = obj.optJSONArray("results");
-                List<Item> list = new ArrayList<>();
-                if (results != null) {
-                    for (int i = 0; i < results.length(); i++) {
-                        JSONObject it = results.optJSONObject(i);
-                        if (it != null) {
-                            String mediaType = it.optString("media_type", "");
-                            if (TYPE_MOVIE.equals(mediaType) || TYPE_TV.equals(mediaType)) {
-                                Item item = Item.fromJson(it);
-                                item.type = mediaType;
-                                if (item.poster != null && !item.poster.isEmpty()) {
-                                    list.add(item);
-                                }
-                            }
-                        }
-                    }
-                }
-                MAIN.post(() -> cb.onSuccess(list));
-            } catch (Exception e) {
-                MAIN.post(() -> cb.onError(e));
-            }
-        });
-    }
-
-    /**
-     * Fetch complete detail for a movie or TV show.
-     */
-    public static void getDetail(String type, long id, Callback<Detail> cb) {
-        IO.execute(() -> {
-            try {
-                String url = TMDB_API + "/" + type + "/" + id + "?api_key=" + TMDB_KEY
-                        + "&append_to_response=external_ids,credits,recommendations,similar";
-                String json = httpGetCached(url, DETAIL_TTL);
-                Detail detail = Detail.fromJson(new JSONObject(json), type);
-                MAIN.post(() -> cb.onSuccess(detail));
-            } catch (Exception e) {
-                MAIN.post(() -> cb.onError(e));
-            }
-        });
-    }
-
-    /**
-     * Fetch episodes for a specific season of a TV show.
-     */
-    public static void getSeasonEpisodes(long tvId, int seasonNumber, Callback<List<Episode>> cb) {
-        IO.execute(() -> {
-            try {
-                String url = TMDB_API + "/tv/" + tvId + "/season/" + seasonNumber + "?api_key=" + TMDB_KEY;
-                String json = httpGetCached(url, DETAIL_TTL);
-                JSONObject obj = new JSONObject(json);
-                JSONArray epArr = obj.optJSONArray("episodes");
-                List<Episode> list = new ArrayList<>();
-                if (epArr != null) {
-                    for (int i = 0; i < epArr.length(); i++) {
-                        JSONObject eObj = epArr.optJSONObject(i);
-                        if (eObj != null) {
-                            Episode ep = new Episode();
-                            ep.id = eObj.optLong("id");
-                            ep.seasonNumber = eObj.optInt("season_number", seasonNumber);
-                            ep.episodeNumber = eObj.optInt("episode_number", i + 1);
-                            ep.title = eObj.optString("name", "Episode " + ep.episodeNumber);
-                            ep.overview = eObj.optString("overview", "");
-                            ep.stillPath = eObj.optString("still_path", "");
-                            ep.airDate = eObj.optString("air_date", "");
-                            list.add(ep);
-                        }
-                    }
-                }
-                MAIN.post(() -> cb.onSuccess(list));
-            } catch (Exception e) {
-                MAIN.post(() -> cb.onError(e));
-            }
-        });
-    }
-
-    /**
-     * Fetch genre list.
-     */
-    public static void getGenres(String type, Callback<List<Genre>> cb) {
-        IO.execute(() -> {
-            try {
-                String url = TMDB_API + "/genre/" + type + "/list?api_key=" + TMDB_KEY;
-                String json = httpGetCached(url, GENRE_TTL);
-                JSONObject obj = new JSONObject(json);
-                JSONArray gArr = obj.optJSONArray("genres");
-                List<Genre> list = new ArrayList<>();
-                if (gArr != null) {
-                    for (int i = 0; i < gArr.length(); i++) {
-                        JSONObject g = gArr.optJSONObject(i);
-                        if (g != null) {
-                            list.add(new Genre(g.optInt("id"), g.optString("name")));
-                        }
-                    }
-                }
-                MAIN.post(() -> cb.onSuccess(list));
-            } catch (Exception e) {
-                MAIN.post(() -> cb.onError(e));
-            }
-        });
-    }
-
-    // ---------------------------------------------------------------- history & watchlist
-
-    public static synchronized void saveProgress(Item item, int season, int episode, long position, long duration) {
+    /** Put a title at the front of "Continue watching" (and remember which episode it was). */
+    public static synchronized void touchRecent(Item item, int season, int episode) {
         if (item == null || prefs == null) return;
         try {
             item.season = season;
             item.episode = episode;
-            item.resumePosition = position;
-            item.duration = duration;
-
             String key = "prog_" + item.type + "_" + item.id;
-            prefs.edit().putString(key, item.toJson().toString()).apply();
-
-            // Update recent list
-            String recentStr = prefs.getString("recent_keys", "[]");
-            JSONArray arr = new JSONArray(recentStr);
+            JSONArray old = new JSONArray(prefs.getString("recent_keys", "[]"));
             JSONArray updated = new JSONArray();
             updated.put(key);
-            for (int i = 0; i < arr.length(); i++) {
-                String k = arr.optString(i);
-                if (!k.equals(key) && updated.length() < 20) {
-                    updated.put(k);
-                }
+            for (int i = 0; i < old.length() && updated.length() < 20; i++) {
+                if (!key.equals(old.optString(i))) updated.put(old.optString(i));
             }
-            prefs.edit().putString("recent_keys", updated.toString()).apply();
-        } catch (Exception ignored) {}
+            SharedPreferences.Editor e = prefs.edit().putString(key, item.toJson().toString())
+                    .putString("recent_keys", updated.toString());
+            if (TYPE_TV.equals(item.type)) e.putString("last_" + item.id, season + "_" + episode);
+            e.apply();
+        } catch (Exception ignored) {
+        }
     }
 
+    /** Titles in progress, most recent first; a film watched to the end drops out. */
     public static synchronized List<Item> getContinueWatching() {
         List<Item> list = new ArrayList<>();
         if (prefs == null) return list;
         try {
-            String recentStr = prefs.getString("recent_keys", "[]");
-            JSONArray arr = new JSONArray(recentStr);
+            JSONArray arr = new JSONArray(prefs.getString("recent_keys", "[]"));
             for (int i = 0; i < arr.length(); i++) {
-                String key = arr.optString(i);
-                String json = prefs.getString(key, null);
-                if (json != null) {
-                    Item it = Item.fromJson(new JSONObject(json));
-                    if (it != null) list.add(it);
-                }
+                String json = prefs.getString(arr.optString(i), null);
+                if (json == null) continue;
+                Item it = Item.fromJson(new JSONObject(json));
+                String key = playKey(it.type, it.id, it.season, it.episode);
+                long pos = position(key);
+                if (pos == -1 && TYPE_MOVIE.equals(it.type)) continue;
+                it.resumePosition = Math.max(pos, 0);
+                it.duration = duration(key);
+                list.add(it);
             }
-        } catch (Exception ignored) {}
+        } catch (Exception ignored) {
+        }
         return list;
     }
 
+    // ---------------------------------------------------------------- watchlist
+
     public static synchronized boolean isInWatchlist(long id, String type) {
-        if (prefs == null) return false;
-        return prefs.contains("watch_" + type + "_" + id);
+        return prefs != null && prefs.contains("watch_" + type + "_" + id);
     }
 
     public static synchronized void toggleWatchlist(Item item) {
         if (item == null || prefs == null) return;
         String key = "watch_" + item.type + "_" + item.id;
         try {
-            if (prefs.contains(key)) {
-                prefs.edit().remove(key).apply();
-            } else {
-                prefs.edit().putString(key, item.toJson().toString()).apply();
-            }
-        } catch (Exception ignored) {}
+            if (prefs.contains(key)) prefs.edit().remove(key).apply();
+            else prefs.edit().putString(key, item.toJson().put("added", System.currentTimeMillis()).toString()).apply();
+        } catch (Exception ignored) {
+        }
     }
 
+    /** The watchlist, newest addition first. */
     public static synchronized List<Item> getWatchlist() {
         List<Item> list = new ArrayList<>();
         if (prefs == null) return list;
+        final Map<Item, Long> added = new HashMap<>();
         try {
-            Map<String, ?> all = prefs.getAll();
-            for (Map.Entry<String, ?> entry : all.entrySet()) {
-                if (entry.getKey().startsWith("watch_")) {
-                    String json = (String) entry.getValue();
-                    Item it = Item.fromJson(new JSONObject(json));
-                    if (it != null) list.add(it);
-                }
+            for (Map.Entry<String, ?> entry : prefs.getAll().entrySet()) {
+                if (!entry.getKey().startsWith("watch_")) continue;
+                JSONObject o = new JSONObject((String) entry.getValue());
+                Item it = Item.fromJson(o);
+                added.put(it, o.optLong("added", 0));
+                list.add(it);
             }
-        } catch (Exception ignored) {}
+        } catch (Exception ignored) {
+        }
+        Collections.sort(list, (a, b) -> Long.compare(added.get(b), added.get(a)));
         return list;
+    }
+
+    // ---------------------------------------------------------------- stream server choice
+
+    /** Index in {@link #SERVERS} of the server the viewer pinned, or -1 for "automatic". */
+    public static int pinnedServer() {
+        String name = prefs == null ? null : prefs.getString("server_pin", null);
+        for (int i = 0; i < SERVERS.size(); i++) if (SERVERS.get(i).name.equals(name)) return i;
+        return -1;
+    }
+
+    public static void pinServer(int index) {
+        if (prefs == null) return;
+        if (index < 0) prefs.edit().remove("server_pin").apply();
+        else prefs.edit().putString("server_pin", SERVERS.get(index).name).apply();
+    }
+
+    private static final long FAIL_MEMORY_MS = 6 * 60 * 60_000L;
+
+    /** Record how a server did: it played after {@code startMs}, or it gave nothing. */
+    public static void serverResult(int index, boolean ok, long startMs) {
+        if (prefs == null) return;
+        String n = SERVERS.get(index).name;
+        SharedPreferences.Editor e = prefs.edit();
+        if (ok) {
+            long old = prefs.getLong("srv_ms_" + n, 0);
+            e.putLong("srv_ms_" + n, old == 0 ? startMs : (old + startMs) / 2).putInt("srv_fail_" + n, 0);
+        } else {
+            e.putInt("srv_fail_" + n, recentFails(n) + 1).putLong("srv_failat_" + n, System.currentTimeMillis());
+        }
+        e.apply();
+    }
+
+    /** Failures in a row, forgotten after six hours so a server that was down gets another chance. */
+    private static int recentFails(String name) {
+        if (System.currentTimeMillis() - prefs.getLong("srv_failat_" + name, 0) > FAIL_MEMORY_MS) return 0;
+        return prefs.getInt("srv_fail_" + name, 0);
+    }
+
+    /**
+     * The servers in the order to try them now: the pinned one first if there is one, then those
+     * that have not been failing, quickest to start first; ones never tried keep their list order
+     * after the proven ones.
+     */
+    public static List<Integer> serverOrder() {
+        List<Integer> out = new ArrayList<>();
+        for (int i = 0; i < SERVERS.size(); i++) out.add(i);
+        if (prefs == null) return out;
+        final int pin = pinnedServer();
+        final long[] rank = new long[out.size()];
+        for (int i = 0; i < rank.length; i++) {
+            String n = SERVERS.get(i).name;
+            long ms = prefs.getLong("srv_ms_" + n, 0);
+            rank[i] = i == pin ? -1 : recentFails(n) * 1_000_000L + (ms > 0 ? Math.min(ms, 90_000) : 100_000 + i);
+        }
+        Collections.sort(out, (a, b) -> Long.compare(rank[a], rank[b]));
+        return out;
+    }
+
+    /** "1:02:03" or "2:03". */
+    public static String time(long ms) {
+        long s = Math.max(ms, 0) / 1000;
+        return s >= 3600 ? String.format(java.util.Locale.US, "%d:%02d:%02d", s / 3600, s / 60 % 60, s % 60)
+                : String.format(java.util.Locale.US, "%d:%02d", s / 60, s % 60);
     }
 
     // ---------------------------------------------------------------- http helpers
-
-    private static List<Item> fetchList(String url, String type) throws Exception {
-        String json = httpGetCached(url, LIST_TTL);
-        JSONObject obj = new JSONObject(json);
-        JSONArray results = obj.optJSONArray("results");
-        List<Item> list = new ArrayList<>();
-        if (results != null) {
-            for (int i = 0; i < results.length(); i++) {
-                JSONObject it = results.optJSONObject(i);
-                if (it != null) {
-                    Item item = Item.fromJson(it);
-                    item.type = type;
-                    if (item.poster != null && !item.poster.isEmpty()) {
-                        list.add(item);
-                    }
-                }
-            }
-        }
-        return list;
-    }
 
     public static String httpGetCached(String urlStr, long ttl) throws Exception {
         String key = md5(urlStr);
@@ -686,6 +658,11 @@ public final class Vb {
         c.setReadTimeout(15_000);
         c.setRequestProperty("User-Agent", UA);
         c.setRequestProperty("Accept", "application/json");
+        int code = c.getResponseCode();
+        if (code != 200) {
+            c.disconnect();
+            throw new java.io.IOException("The catalogue answered with error " + code + ".");
+        }
         try (InputStream in = c.getInputStream()) {
             String res = new String(readAll(in), "UTF-8");
             memCache.put(key, new Object[]{now, res});
