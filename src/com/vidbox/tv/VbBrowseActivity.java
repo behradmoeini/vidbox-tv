@@ -89,7 +89,7 @@ public class VbBrowseActivity extends Activity {
         // --- top bar
         tabRow = new LinearLayout(this);
         tabRow.setGravity(Gravity.CENTER_VERTICAL);
-        tabRow.addView(VbUi.label(this, "Vidbox", 20, VbUi.ACCENT, true), VbUi.lp(-2, -2, 0, 0, VbUi.dp(this, 24), 0));
+        tabRow.addView(VbUi.label(this, "Watch", 20, VbUi.ACCENT, true), VbUi.lp(-2, -2, 0, 0, VbUi.dp(this, 24), 0));
         for (String name : new String[]{HOME, MOVIES, SHOWS, GENRES, WATCHLIST, SEARCH}) addTab(name);
         // Right end of the bar: the installed version, and an update's progress while one is coming in.
         tabRow.addView(new View(this), new LinearLayout.LayoutParams(0, 1, 1f));

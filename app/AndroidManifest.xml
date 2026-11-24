@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Vidbox TV: Android TV streaming app for vidbox.wtf -->
+<!-- Watch (package com.vidbox.tv): films and series on Android TV -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.vidbox.tv">
 
@@ -13,7 +13,7 @@
     <uses-feature android:name="android.hardware.touchscreen" android:required="false"/>
 
     <application
-        android:label="Vidbox TV"
+        android:label="Watch"
         android:icon="@mipmap/icon"
         android:banner="@drawable/banner"
         android:supportsRtl="false"
@@ -45,12 +45,6 @@
             android:hardwareAccelerated="true"
             android:screenOrientation="landscape"
             android:configChanges="keyboard|keyboardHidden|navigation|orientation|screenLayout|screenSize"/>
-
-        <receiver android:name="com.vidbox.tv.VbUpdated" android:exported="false">
-            <intent-filter>
-                <action android:name="android.intent.action.MY_PACKAGE_REPLACED"/>
-            </intent-filter>
-        </receiver>
 
     </application>
 </manifest>

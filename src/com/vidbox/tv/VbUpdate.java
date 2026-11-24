@@ -7,6 +7,7 @@ import android.content.Intent;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageInstaller;
 import android.os.Build;
+import android.util.Log;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -26,10 +27,11 @@ import java.net.URL;
  * versionCode the APK is downloaded and installed straight away, behind a box that says so.
  *
  * Android installs it without asking when this app is its own installer of record and holds
- * UPDATE_PACKAGES_WITHOUT_USER_ACTION (Android 12+). The first copy is sideloaded with
- * {@code adb install -i com.vidbox.tv}, so that holds from the start; where it does not, the system
- * shows its own confirmation once, and after that update this app is the installer of record.
- * Replacing the app closes it, so the viewer is told and {@link VbUpdated} opens it again.
+ * UPDATE_PACKAGES_WITHOUT_USER_ACTION (Android 12+), and the viewer has once allowed it to install
+ * apps. The first copy is sideloaded with {@code adb install -i com.vidbox.tv}; on the first update
+ * the system shows its own confirmation and the "install unknown apps" switch, once.
+ * Replacing the app closes it and Android does not let an app reopen itself from the background
+ * (tried on Android 14: the start is blocked), so the box says to open it again.
  */
 public final class VbUpdate {
     public static String MANIFEST_URL = "https://raw.githubusercontent.com/behradmoeini/vidbox-tv/main/version.json";
@@ -62,13 +64,14 @@ public final class VbUpdate {
         Vb.async(() -> {
             JSONObject m = new JSONObject(Vb.httpGetCached(MANIFEST_URL, 60_000L));
             String url = m.optString("apk_url");
+            Log.i("Vidbox", "update check: installed " + mine + ", published " + m.optLong("version_code", 0));
             if (m.optLong("version_code", 0) <= mine || url.isEmpty()) return null;
             final String name = m.optString("version_name", "");
             // Shown while it happens, with nothing to press: the update installs by itself.
             Vb.MAIN.post(() -> {
                 if (a.isFinishing() || a.isDestroyed()) return;
                 box[0] = new AlertDialog.Builder(a, android.R.style.Theme_DeviceDefault_Dialog_Alert)
-                        .setTitle("Updating Vidbox to " + name)
+                        .setTitle("Updating Watch to " + name)
                         .setMessage("Downloading… 0%")
                         .setCancelable(false)
                         .show();
@@ -78,6 +81,7 @@ public final class VbUpdate {
             }));
         }, (apk, err) -> {
             busy = false;
+            if (err != null) Log.i("Vidbox", "update failed: " + err);
             if (err != null) {
                 snoozedUntil = System.currentTimeMillis() + SNOOZE_MS;
                 dismiss(box[0]);
@@ -92,8 +96,9 @@ public final class VbUpdate {
                 return;
             }
             try {
-                box[0].setMessage("Installing… Vidbox closes for a moment and opens again.");
+                box[0].setMessage("Installing… Watch will close. Open it again from the home screen.");
                 install(a, apk);
+                Log.i("Vidbox", "update handed to the installer");
                 Vb.MAIN.postDelayed(() -> dismiss(box[0]), 20_000); // still here: the system is asking instead
             } catch (Exception e) {
                 snoozedUntil = System.currentTimeMillis() + SNOOZE_MS;
@@ -162,6 +167,7 @@ public final class VbUpdate {
     public static boolean onStatus(Activity a, Intent i) {
         if (i == null || !STATUS.equals(i.getAction())) return false;
         int st = i.getIntExtra(PackageInstaller.EXTRA_STATUS, PackageInstaller.STATUS_FAILURE);
+        Log.i("Vidbox", "installer status " + st + " " + i.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE));
         if (st == PackageInstaller.STATUS_PENDING_USER_ACTION) {
             Intent confirm = i.getParcelableExtra(Intent.EXTRA_INTENT);
             if (confirm != null) {

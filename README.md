@@ -1,6 +1,7 @@
-# Vidbox TV
+# Watch (Vidbox TV)
 
-An Android TV app that browses films and series (catalogue from TMDB) and plays them through the
+On the TV the app is called **Watch**; the package (`com.vidbox.tv`) and this repository keep the
+name it started with. An Android TV app that browses films and series (catalogue from TMDB) and plays them through the
 stream servers [vidbox.wtf](https://vidbox.wtf) uses. A companion web portal lives in `web/`.
 
 Built the same way as «شبکه نمایش خانگی» in `alphadl-tv`: plain Java against the Android framework,
@@ -19,7 +20,7 @@ src/com/vidbox/tv/
   VbBrowseActivity.java     Home rows; Movies, TV Shows, Genres, Watchlist, Search grids
   VbDetailActivity.java     one title: facts, buttons, episodes or similar films
   VbPlayerActivity.java     the player
-  VbUpdate.java             self-update; VbUpdated.java reopens the app after one
+  VbUpdate.java             self-update
 .github/workflows/build-apk.yml   builds, signs and publishes every push to main
 .github/scripts/progress.sh       the "build progress" status on the commit
 web/                        companion web portal
@@ -117,7 +118,9 @@ a throwaway key and warns that the build cannot update an installed app.
 The app reads `version.json` from `main` each time its main screen comes to the front (at most
 every three minutes). When it names a newer build the app downloads and installs it without
 asking, behind a box that shows the download's progress, and only while the main screen is in
-front, never during a film. The app closes for the install and opens again. The installed version
+front, never during a film. The first time, Android shows its own confirmation and asks to allow
+this app to install apps; after that it is silent. Installing closes the app, and Android does not
+let it reopen itself, so the box says to open it again. The installed version
 is shown at the right end of the tab bar. A local `dev` build never updates itself.
 
 ## Icon and TV tile

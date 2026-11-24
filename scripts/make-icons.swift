@@ -40,5 +40,5 @@ func draw(_ name: String, width: Int, height: Int, fontSize: CGFloat, to path: S
     print("wrote \(path) (\(width)x\(height))")
 }
 
-draw("Vidbox", width: 640, height: 360, fontSize: 104, to: "app/res/drawable-xhdpi/banner.png")
-draw("Vidbox", width: 192, height: 192, fontSize: 43, to: "app/res/mipmap-xxhdpi/icon.png")
+draw("Watch", width: 640, height: 360, fontSize: 104, to: "app/res/drawable-xhdpi/banner.png")
+draw("Watch", width: 192, height: 192, fontSize: 43, to: "app/res/mipmap-xxhdpi/icon.png")
