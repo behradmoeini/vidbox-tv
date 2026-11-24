@@ -1,11 +1,13 @@
 package com.vidbox.tv;
 
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.app.PendingIntent;
 import android.content.Intent;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageInstaller;
 import android.os.Build;
+import android.widget.TextView;
 import android.widget.Toast;
 
 import org.json.JSONObject;
@@ -21,7 +23,7 @@ import java.net.URL;
 /**
  * Self-update, with nothing for the viewer to do. Each time the main screen comes to the front the
  * app reads the small manifest CI publishes ({@code version.json} on main); when it names a higher
- * versionCode the APK is downloaded and installed straight away.
+ * versionCode the APK is downloaded and installed straight away, behind a box that says so.
  *
  * Android installs it without asking when this app is its own installer of record and holds
  * UPDATE_PACKAGES_WITHOUT_USER_ACTION (Android 12+). The first copy is sideloaded with
@@ -39,50 +41,80 @@ public final class VbUpdate {
 
     private VbUpdate() {}
 
-    public static void check(final Activity a) {
+    /** {@code label} is the small text on the main screen that shows the installed version. */
+    public static void check(final Activity a, final TextView label) {
         // Called every time the main screen comes to the front. The app's process usually outlives
         // the screen (Back does not kill it), so checking once per process would almost never run.
-        long now = System.currentTimeMillis();
-        if (busy || now - lastCheck < EVERY_MS || now < snoozedUntil) return;
-        lastCheck = now;
         final long mine;
         try {
             PackageInfo pi = a.getPackageManager().getPackageInfo(a.getPackageName(), 0);
+            label.setText("v" + pi.versionName);
             if ("dev".equals(pi.versionName)) return; // local build: a release could not replace it anyway
             mine = pi.versionCode;
         } catch (Exception e) {
             return;
         }
+        long now = System.currentTimeMillis();
+        if (busy || now - lastCheck < EVERY_MS || now < snoozedUntil) return;
+        lastCheck = now;
         busy = true;
+        final AlertDialog[] box = new AlertDialog[1];
         Vb.async(() -> {
             JSONObject m = new JSONObject(Vb.httpGetCached(MANIFEST_URL, 60_000L));
             String url = m.optString("apk_url");
             if (m.optLong("version_code", 0) <= mine || url.isEmpty()) return null;
             final String name = m.optString("version_name", "");
-            Vb.MAIN.post(() -> Toast.makeText(a, "Getting Vidbox " + name + "…", Toast.LENGTH_LONG).show());
-            return download(a, url);
+            // Shown while it happens, with nothing to press: the update installs by itself.
+            Vb.MAIN.post(() -> {
+                if (a.isFinishing() || a.isDestroyed()) return;
+                box[0] = new AlertDialog.Builder(a, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                        .setTitle("Updating Vidbox to " + name)
+                        .setMessage("Downloading… 0%")
+                        .setCancelable(false)
+                        .show();
+            });
+            return download(a, url, pct -> Vb.MAIN.post(() -> {
+                if (box[0] != null) box[0].setMessage("Downloading… " + pct + "%");
+            }));
         }, (apk, err) -> {
             busy = false;
             if (err != null) {
                 snoozedUntil = System.currentTimeMillis() + SNOOZE_MS;
+                dismiss(box[0]);
+                if (box[0] != null) Toast.makeText(a, "Update failed: " + err.getMessage(), Toast.LENGTH_LONG).show();
                 return;
             }
+            if (apk == null) return;
             // Only while the main screen is still in front: never in the middle of a film.
-            if (apk == null || a.isFinishing() || a.isDestroyed() || !a.hasWindowFocus()) {
-                if (apk != null) lastCheck = 0; // ask again the next time the main screen opens
+            if (a.isFinishing() || a.isDestroyed() || box[0] == null || !box[0].isShowing()) {
+                lastCheck = 0; // ask again the next time the main screen opens
+                dismiss(box[0]);
                 return;
             }
             try {
-                Toast.makeText(a, "Updating Vidbox. It closes for a moment and opens again.", Toast.LENGTH_LONG).show();
+                box[0].setMessage("Installing… Vidbox closes for a moment and opens again.");
                 install(a, apk);
+                Vb.MAIN.postDelayed(() -> dismiss(box[0]), 20_000); // still here: the system is asking instead
             } catch (Exception e) {
                 snoozedUntil = System.currentTimeMillis() + SNOOZE_MS;
+                dismiss(box[0]);
                 Toast.makeText(a, "Update failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
             }
         });
     }
 
-    private static File download(Activity a, String url) throws Exception {
+    private static void dismiss(AlertDialog d) {
+        try {
+            if (d != null) d.dismiss();
+        } catch (Exception ignored) {
+        }
+    }
+
+    private interface Progress {
+        void at(int percent);
+    }
+
+    private static File download(Activity a, String url, Progress progress) throws Exception {
         File dir = new File(a.getCacheDir(), "update");
         dir.mkdirs();
         File out = new File(dir, "update.apk");
@@ -91,8 +123,15 @@ public final class VbUpdate {
         c.setReadTimeout(30_000);
         c.setRequestProperty("User-Agent", Vb.UA);
         try (InputStream in = c.getInputStream(); OutputStream os = new FileOutputStream(out)) {
+            long total = c.getContentLength(), done = 0;
+            int last = -1;
             byte[] buf = new byte[64 * 1024];
-            for (int n; (n = in.read(buf)) > 0; ) os.write(buf, 0, n);
+            for (int n; (n = in.read(buf)) > 0; ) {
+                os.write(buf, 0, n);
+                done += n;
+                int pct = total > 0 ? (int) (done * 100 / total) : 0;
+                if (pct != last) progress.at(last = pct);
+            }
         } finally {
             c.disconnect();
         }

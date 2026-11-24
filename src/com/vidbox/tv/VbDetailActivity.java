@@ -130,8 +130,11 @@ public class VbDetailActivity extends Activity {
             list = new ListView(this);
             list.setDivider(null);
             list.setVerticalScrollBarEnabled(false);
-            list.setSelector(VbUi.round(0xFF26262C, VbUi.dp(this, 8), VbUi.dp(this, 3), 0xFFFFFFFF));
-            list.setDrawSelectorOnTop(false);
+            // The ring is drawn only while the list has focus, so two things never look focused at once.
+            final android.graphics.drawable.Drawable ring = VbUi.round(0xFF26262C, VbUi.dp(this, 8), VbUi.dp(this, 3), 0xFFFFFFFF);
+            final android.graphics.drawable.Drawable none = new ColorDrawable(0);
+            list.setSelector(none);
+            list.setOnFocusChangeListener((v, f) -> list.setSelector(f ? ring : none));
             list.setAdapter(rows);
             list.setOnItemClickListener((p, v, pos, id) -> playEpisode(shown.get(pos), false));
             col.addView(list, new LinearLayout.LayoutParams(-1, 0, 1f));

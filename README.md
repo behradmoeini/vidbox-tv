@@ -43,8 +43,12 @@ if you finished it. A film shows a row of similar films.
 ### Focus and the remote
 
 Focus looks the same everywhere: a button turns white with dark text; a poster card gets a white
-ring, grows slightly, and its title turns white and scrolls if it is too long to fit. There is no
-blur and no translucent layering, because the TV's graphics chip is weak.
+ring, grows slightly, and its title turns white and scrolls if it is too long to fit.
+
+Behind the browse page is the focused title's picture as a soft, dark wash of its colours. The
+TV's graphics chip is weak, so this is one tiny image stretched over the screen (which blurs it
+for free) and darkened by a colour filter in the same draw: no blur effect, no translucent layers.
+Moving around Home with it measured 19 ms a frame at the median and 24 ms at the 99th percentile.
 
 - Up from the first row or the top of a grid reaches the tabs.
 - Back from a page goes to its tab; Back on a tab goes to Home; Back on the Home tab leaves the app.
@@ -112,8 +116,9 @@ a throwaway key and warns that the build cannot update an installed app.
 
 The app reads `version.json` from `main` each time its main screen comes to the front (at most
 every three minutes). When it names a newer build the app downloads and installs it without
-asking, and only while the main screen is in front, never during a film. The app closes for the
-install and opens again. A local `dev` build never updates itself.
+asking, behind a box that shows the download's progress, and only while the main screen is in
+front, never during a film. The app closes for the install and opens again. The installed version
+is shown at the right end of the tab bar. A local `dev` build never updates itself.
 
 ## Icon and TV tile
 

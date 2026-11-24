@@ -169,6 +169,7 @@ final class VbUi {
         h.title.setTextColor(on ? Color.WHITE : DIM);
         marquee(h.title, on);
         float s = on ? 1.06f : 1f;
+        card.animate().cancel(); // one still growing would otherwise finish after focus has left
         if (card.getScaleX() != s) card.animate().scaleX(s).scaleY(s).setDuration(120).start();
     }
 

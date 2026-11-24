@@ -20,6 +20,7 @@ import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.GridView;
 import android.widget.HorizontalScrollView;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
@@ -46,6 +47,10 @@ public class VbBrowseActivity extends Activity {
     private GridView grid;
     private TextView status;
     private EditText searchBox;
+    private TextView version;
+    private ImageView backdrop;
+    private String backdropUrl;
+    private int backdropGen;
     private HorizontalScrollView genreScroll;
     private LinearLayout genreRow, tabRow;
 
@@ -80,13 +85,16 @@ public class VbBrowseActivity extends Activity {
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setPadding(pad, VbUi.dp(this, 20), pad, 0);
-        root.setClipChildren(false);
 
         // --- top bar
         tabRow = new LinearLayout(this);
         tabRow.setGravity(Gravity.CENTER_VERTICAL);
         tabRow.addView(VbUi.label(this, "Vidbox", 20, VbUi.ACCENT, true), VbUi.lp(-2, -2, 0, 0, VbUi.dp(this, 24), 0));
         for (String name : new String[]{HOME, MOVIES, SHOWS, GENRES, WATCHLIST, SEARCH}) addTab(name);
+        // Right end of the bar: the installed version, and an update's progress while one is coming in.
+        tabRow.addView(new View(this), new LinearLayout.LayoutParams(0, 1, 1f));
+        version = VbUi.label(this, "", 13, VbUi.DIM, false);
+        tabRow.addView(version);
         root.addView(tabRow, VbUi.lp(-1, -2, 0, 0, 0, VbUi.dp(this, 12)));
 
         // --- search box (Search tab only)
@@ -120,7 +128,6 @@ public class VbBrowseActivity extends Activity {
 
         // --- grid, status line and the Home rows share the rest of the screen
         FrameLayout body = new FrameLayout(this);
-        body.setClipChildren(false);
         grid = new GridView(this);
         grid.setNumColumns(COLS);
         grid.setHorizontalSpacing(gap);
@@ -142,6 +149,7 @@ public class VbBrowseActivity extends Activity {
             public void onItemSelected(AdapterView<?> p, View v, int pos, long id) {
                 selected = pos;
                 mark();
+                if (grid.hasFocus() && pos >= 0 && pos < items.size()) showBackdrop(items.get(pos));
                 if (pos >= items.size() - 2 * COLS) loadMore();
             }
 
@@ -167,7 +175,6 @@ public class VbBrowseActivity extends Activity {
         body.addView(status, new FrameLayout.LayoutParams(-1, -2, Gravity.CENTER));
         homeScroll = new ScrollView(this);
         homeScroll.setVerticalScrollBarEnabled(false);
-        homeScroll.setClipChildren(false);
         homeRows = new LinearLayout(this);
         homeRows.setOrientation(LinearLayout.VERTICAL);
         homeRows.setClipChildren(false);
@@ -175,7 +182,18 @@ public class VbBrowseActivity extends Activity {
         homeScroll.addView(homeRows, new FrameLayout.LayoutParams(-1, -2));
         body.addView(homeScroll, new FrameLayout.LayoutParams(-1, -1));
         root.addView(body, new LinearLayout.LayoutParams(-1, 0, 1f));
-        setContentView(root);
+
+        // Behind the page: the focused title's picture, as a soft wash of its colours. It is decoded
+        // tiny and stretched over the screen, which blurs it for free, and darkened in the same
+        // draw by a colour filter: one image, no blur effect and no extra translucent layer.
+        FrameLayout page = new FrameLayout(this);
+        backdrop = new ImageView(this);
+        backdrop.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        backdrop.setColorFilter(0xB30B0B0D);
+        backdrop.setAlpha(0f);
+        page.addView(backdrop, new FrameLayout.LayoutParams(-1, -1));
+        page.addView(root, new FrameLayout.LayoutParams(-1, -1));
+        setContentView(page);
 
         select(HOME);
         tabs.get(0).requestFocus();
@@ -185,7 +203,7 @@ public class VbBrowseActivity extends Activity {
     @Override
     protected void onStart() {
         super.onStart();
-        VbUpdate.check(this);
+        VbUpdate.check(this, version);
     }
 
     @Override
@@ -312,8 +330,16 @@ public class VbBrowseActivity extends Activity {
             card.setOnClickListener(v -> open(it));
             card.setOnFocusChangeListener((v, has) -> {
                 VbUi.focus(v, has);
-                if (has) homeScroll.smoothScrollTo(0, Math.max(0, r.box.getTop()));
+                if (!has) return;
+                showBackdrop(it);
+                homeScroll.smoothScrollTo(0, Math.max(0, r.box.getTop()));
+                // Keep the focused card clear of the screen's edges, where its ring would be cut.
+                r.scroll.smoothScrollTo(v.getLeft() - (r.scroll.getWidth() - v.getWidth()) / 2, 0);
             });
+            // Left and Right stay inside the row: at its ends they do nothing rather than jump to another row.
+            final boolean first = i == 0, last = i == n - 1;
+            card.setOnKeyListener((v, code, ev) -> (first && code == KeyEvent.KEYCODE_DPAD_LEFT)
+                    || (last && code == KeyEvent.KEYCODE_DPAD_RIGHT));
             r.line.addView(card, VbUi.lp(w, -2, 0, 0, VbUi.dp(this, 14), 0));
         }
         VbUi.gone(r.box, n == 0);
@@ -321,6 +347,22 @@ public class VbBrowseActivity extends Activity {
             if (n > 0) r.line.getChildAt(Math.max(0, Math.min(focused, n - 1))).requestFocus();
             else tab(HOME).requestFocus();
         }
+    }
+
+    /** Put {@code it}'s picture behind the page, after a short pause so moving along a row stays light. */
+    private void showBackdrop(Vb.Item it) {
+        final String url = it == null ? null : VbUi.sized(it.getBackdropUrl(), 300);
+        if (url == null ? backdropUrl == null : url.equals(backdropUrl)) return;
+        backdropUrl = url;
+        final int g = ++backdropGen;
+        Vb.MAIN.postDelayed(() -> {
+            if (g != backdropGen || isFinishing()) return;
+            backdrop.animate().alpha(0f).setDuration(150).withEndAction(() -> {
+                if (g != backdropGen || url == null) return;
+                VbUi.image(backdrop, url, 48);
+                backdrop.animate().alpha(1f).setDuration(350).start();
+            }).start();
+        }, 250);
     }
 
     private void load(final Row r, final Vb.Job<Vb.Page> job) {
