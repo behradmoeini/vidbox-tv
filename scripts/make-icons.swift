@@ -10,7 +10,7 @@ func rgb(_ hex: Int) -> CGColor {
             blue: CGFloat(hex & 0xFF) / 255, alpha: 1)
 }
 
-func draw(_ name: String, width: Int, height: Int, fontSize: CGFloat, to path: String) {
+func draw(_ name: String, width: Int, height: Int, fontSize: CGFloat, textY: CGFloat, barY: CGFloat, to path: String) {
     let space = CGColorSpace(name: CGColorSpace.sRGB)!
     let ctx = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
                         space: space, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
@@ -21,18 +21,18 @@ func draw(_ name: String, width: Int, height: Int, fontSize: CGFloat, to path: S
                               locations: [0, 1])!
     ctx.drawLinearGradient(gradient, start: CGPoint(x: 0, y: 0), end: CGPoint(x: w, y: h), options: [])
 
-    // The bar: 40% of the width, centred, a tenth of the height up from the bottom.
+    // The bar: 40% of the width, centred, `barY` of the height up from the bottom.
     let barH = max(2, (h * 0.017).rounded())
     ctx.setFillColor(rgb(0x3DBEEC))
-    ctx.fill(CGRect(x: w * 0.30, y: h * 0.10 - barH / 2, width: w * 0.40, height: barH))
+    ctx.fill(CGRect(x: w * 0.30, y: h * barY - barH / 2, width: w * 0.40, height: barH))
 
-    // The name, centred a little above the middle so it sits evenly between the top and the bar.
+    // The name, centred on `textY` of the height (from the bottom).
     let font = NSFont(name: "Helvetica-Bold", size: fontSize)!
     let text = NSAttributedString(string: name, attributes: [.font: font, .foregroundColor: NSColor.white])
     let line = CTLineCreateWithAttributedString(text)
     let bounds = CTLineGetBoundsWithOptions(line, .useGlyphPathBounds)
     ctx.textPosition = CGPoint(x: (w - bounds.width) / 2 - bounds.minX,
-                               y: h * 0.56 - bounds.height / 2 - bounds.minY)
+                               y: h * textY - bounds.height / 2 - bounds.minY)
     CTLineDraw(line, ctx)
 
     let rep = NSBitmapImageRep(cgImage: ctx.makeImage()!)
@@ -40,5 +40,7 @@ func draw(_ name: String, width: Int, height: Int, fontSize: CGFloat, to path: S
     print("wrote \(path) (\(width)x\(height))")
 }
 
-draw("Watch", width: 640, height: 360, fontSize: 104, to: "app/res/drawable-xhdpi/banner.png")
-draw("Watch", width: 192, height: 192, fontSize: 43, to: "app/res/mipmap-xxhdpi/icon.png")
+draw("Watch", width: 640, height: 360, fontSize: 104, textY: 0.56, barY: 0.10, to: "app/res/drawable-xhdpi/banner.png")
+// The home screen crops the icon to a circle, so the bar sits just under the name, well inside it
+// (at the square's bottom edge it would land on the circle's rim).
+draw("Watch", width: 192, height: 192, fontSize: 43, textY: 0.53, barY: 0.27, to: "app/res/mipmap-xxhdpi/icon.png")
