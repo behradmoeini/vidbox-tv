@@ -1,0 +1,127 @@
+name: Build & Release APK
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - '.gitignore'
+  workflow_dispatch:
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Android SDK Build Tools
+        run: |
+          echo "ANDROID_HOME=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
+          BT_DIR="$(ls -d "$ANDROID_SDK_ROOT"/build-tools/* | sort -V | tail -1)"
+          echo "ANDROID_BUILD_TOOLS=$BT_DIR" >> "$GITHUB_ENV"
+          echo "Using Android build-tools: $BT_DIR"
+
+      - name: Prepare Signing Keystore
+        env:
+          VB_KEYSTORE_BASE64: ${{ secrets.VB_KEYSTORE_BASE64 }}
+          VB_KEYSTORE_PASSWORD: ${{ secrets.VB_KEYSTORE_PASSWORD }}
+          VB_KEY_ALIAS: ${{ secrets.VB_KEY_ALIAS }}
+          VB_KEY_PASSWORD: ${{ secrets.VB_KEY_PASSWORD }}
+        run: |
+          mkdir -p keystore
+          if [ -n "$VB_KEYSTORE_BASE64" ]; then
+            echo "$VB_KEYSTORE_BASE64" | base64 -d > keystore/release.jks
+            echo "VB_KS=keystore/release.jks" >> "$GITHUB_ENV"
+            echo "VB_KS_PASS=${VB_KEYSTORE_PASSWORD:-android}" >> "$GITHUB_ENV"
+            echo "VB_ALIAS=${VB_KEY_ALIAS:-vidbox}" >> "$GITHUB_ENV"
+            echo "VB_KEY_PASS=${VB_KEY_PASSWORD:-android}" >> "$GITHUB_ENV"
+            echo "Restored custom signing key from secrets."
+          else
+            # Generate deterministic signing keystore for CI builds
+            keytool -genkeypair -keystore keystore/ci-release.jks -storepass vidbox_release_2026 \
+              -keypass vidbox_release_2026 -alias vidbox -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Vidbox TV, O=Vidbox, C=US"
+            echo "VB_KS=keystore/ci-release.jks" >> "$GITHUB_ENV"
+            echo "VB_KS_PASS=vidbox_release_2026" >> "$GITHUB_ENV"
+            echo "VB_ALIAS=vidbox" >> "$GITHUB_ENV"
+            echo "VB_KEY_PASS=vidbox_release_2026" >> "$GITHUB_ENV"
+            echo "Generated CI signing key."
+          fi
+
+      - name: Build Vidbox TV APK
+        id: build_apk
+        run: |
+          VC=$((1000 + GITHUB_RUN_NUMBER))
+          VN="1.0.${GITHUB_RUN_NUMBER}"
+          echo "Building versionCode $VC ($VN)..."
+          
+          VC="$VC" VN="$VN" ./scripts/build.sh
+          
+          ls -lh build/VidboxTV.apk
+          echo "vc=$VC" >> "$GITHUB_OUTPUT"
+          echo "vn=$VN" >> "$GITHUB_OUTPUT"
+
+      - name: Generate Version Manifest
+        run: |
+          cat > version.json <<EOF
+          {
+            "version_code": ${{ steps.build_apk.outputs.vc }},
+            "version_name": "${{ steps.build_apk.outputs.vn }}",
+            "apk_url": "https://github.com/${{ github.repository }}/releases/download/latest/VidboxTV.apk",
+            "release_url": "https://github.com/${{ github.repository }}/releases/tag/v${{ steps.build_apk.outputs.vn }}"
+          }
+          EOF
+          cat version.json
+
+      - name: Commit version.json to main
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add version.json
+          if ! git diff --staged --quiet; then
+            git commit -m "Update version manifest to v${{ steps.build_apk.outputs.vn }} [skip ci]"
+            git push origin main
+          fi
+
+      - name: Publish to GitHub Releases (Public)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Delete previous 'latest' release and recreate with fresh APK
+          gh release delete latest --yes --cleanup-tag 2>/dev/null || true
+          
+          gh release create latest build/VidboxTV.apk version.json \
+            --title "Vidbox TV v${{ steps.build_apk.outputs.vn }}" \
+            --notes "### Vidbox TV — Android TV Build v${{ steps.build_apk.outputs.vn }} (versionCode ${{ steps.build_apk.outputs.vc }})
+          
+          - **Download APK**: [VidboxTV.apk](https://github.com/${{ github.repository }}/releases/download/latest/VidboxTV.apk)
+          - Built from commit \`${GITHUB_SHA}\`
+          
+          #### How to install on Android TV:
+          \`\`\`bash
+          adb install -r VidboxTV.apk
+          \`\`\`"
+
+          # Also create tagged release
+          TAG="v${{ steps.build_apk.outputs.vn }}"
+          gh release create "$TAG" build/VidboxTV.apk version.json \
+            --title "Vidbox TV $TAG" \
+            --notes "Release $TAG (versionCode ${{ steps.build_apk.outputs.vc }})."

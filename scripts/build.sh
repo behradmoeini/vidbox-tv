@@ -16,7 +16,7 @@ fi
 
 SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
 if [ -z "$SDK" ]; then
-  for d in "$HOME/Library/Android/sdk" /opt/homebrew/share/android-commandlinetools; do
+  for d in "$HOME/Library/Android/sdk" /opt/homebrew/share/android-commandlinetools /usr/local/lib/android/sdk; do
     [ -d "$d/platforms" ] && SDK="$d" && break
   done
 fi
