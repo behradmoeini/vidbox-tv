@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Vidbox Web — Streaming Guide & Player</title>
+  <link rel="stylesheet" href="style.css">
+  <link rel="icon" href="../app/res/mipmap-xxhdpi/icon.png">
+</head>
+<body>
+  <header class="navbar">
+    <div class="nav-left">
+      <div class="logo">VIDBOX <span class="badge">TV & WEB</span></div>
+      <nav class="nav-links">
+        <button class="nav-btn active" data-tab="home">Home</button>
+        <button class="nav-btn" data-tab="movies">Movies</button>
+        <button class="nav-btn" data-tab="tv">TV Shows</button>
+        <button class="nav-btn" data-tab="watchlist">Watchlist</button>
+      </nav>
+    </div>
+    <div class="nav-right">
+      <div class="search-box">
+        <input type="text" id="searchInput" placeholder="Search movies, TV shows...">
+        <button id="searchBtn">🔍</button>
+      </div>
+    </div>
+  </header>
+
+  <!-- Hero Spotlight -->
+  <section class="hero" id="heroSection">
+    <div class="hero-backdrop" id="heroBackdrop"></div>
+    <div class="hero-overlay"></div>
+    <div class="hero-content">
+      <h1 class="hero-title" id="heroTitle">Loading featured title...</h1>
+      <div class="hero-meta" id="heroMeta">
+        <span class="rating" id="heroRating">★ 8.5</span>
+        <span class="year" id="heroYear">2024</span>
+        <span class="type-tag" id="heroType">Movie</span>
+      </div>
+      <p class="hero-overview" id="heroOverview"></p>
+      <div class="hero-actions">
+        <button class="btn btn-primary" id="heroPlayBtn">▶ Watch Now</button>
+        <button class="btn btn-secondary" id="heroWatchlistBtn">+ Watchlist</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- Main Rows -->
+  <main class="container" id="mainContainer">
+    <!-- Rows dynamically injected by app.js -->
+  </main>
+
+  <!-- Streaming Player Modal -->
+  <div class="player-modal" id="playerModal">
+    <div class="player-container">
+      <div class="player-header">
+        <div class="player-title" id="playerTitle">Now Playing</div>
+        <div class="player-controls">
+          <label for="serverSelect">Server:</label>
+          <select id="serverSelect" class="server-select">
+            <option value="echo">Echo (VidLink)</option>
+            <option value="max">Max (YTHD)</option>
+            <option value="4k">4K (Vidrift)</option>
+            <option value="vidfast">Vidfast</option>
+            <option value="v2">V2 (VAPlayer)</option>
+            <option value="vidpro">Vidpro (Vixsrc)</option>
+            <option value="premium">Premium (Vidy)</option>
+            <option value="nxsha">Nxsha</option>
+            <option value="2embed">2Embed</option>
+            <option value="cinemaos">Cinemaos</option>
+          </select>
+          <button class="close-btn" id="closePlayerBtn">&times;</button>
+        </div>
+      </div>
+      <!-- TV Episode Bar (hidden for movies) -->
+      <div class="episode-bar" id="episodeBar" style="display: none;">
+        <div class="ep-selectors">
+          <label>Season: <select id="seasonSelect"></select></label>
+          <label>Episode: <select id="episodeSelect"></select></label>
+        </div>
+        <button class="btn-sm" id="prevEpBtn">⏮ Prev</button>
+        <button class="btn-sm" id="nextEpBtn">Next ⏭</button>
+      </div>
+      <div class="iframe-wrapper">
+        <iframe id="playerIframe" src="" allowfullscreen allow="autoplay; encrypted-media; picture-in-picture"></iframe>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
