@@ -11,6 +11,7 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
 import android.widget.BaseAdapter;
+import android.widget.FrameLayout;
 import android.widget.HorizontalScrollView;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
@@ -125,7 +126,12 @@ public class VbDetailActivity extends Activity {
             hs.setHorizontalScrollBarEnabled(false);
             seasonRow = new LinearLayout(this);
             hs.addView(seasonRow);
-            col.addView(hs, VbUi.lp(-1, -2, 0, 0, 0, VbUi.dp(this, 8)));
+            // The column does not clip its children (so focused cards can grow past its edge), which
+            // also let this row, once scrolled, spill out to the left over the poster. A frame of its
+            // own keeps the row inside the column: seasons that scroll off are cut at the column's edge.
+            FrameLayout seasonClip = new FrameLayout(this);
+            seasonClip.addView(hs, new FrameLayout.LayoutParams(-1, -2));
+            col.addView(seasonClip, VbUi.lp(-1, -2, 0, 0, 0, VbUi.dp(this, 8)));
 
             list = new ListView(this);
             list.setDivider(null);
@@ -137,7 +143,11 @@ public class VbDetailActivity extends Activity {
             list.setOnFocusChangeListener((v, f) -> list.setSelector(f ? ring : none));
             list.setAdapter(rows);
             list.setOnItemClickListener((p, v, pos, id) -> playEpisode(shown.get(pos), false));
-            col.addView(list, new LinearLayout.LayoutParams(-1, 0, 1f));
+            // Same as the season row: without a frame of its own, an episode that is scrolled half off
+            // the top is drawn above the list, over the seasons.
+            FrameLayout listClip = new FrameLayout(this);
+            listClip.addView(list, new FrameLayout.LayoutParams(-1, -1));
+            col.addView(listClip, new LinearLayout.LayoutParams(-1, 0, 1f));
         } else {
             // Films: a row of similar films fills the space a series uses for its episodes.
             TextView head = VbUi.label(this, "More like this", 18, VbUi.TEXT, true);
