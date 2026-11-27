@@ -687,6 +687,11 @@ public final class Vb {
         return out.toByteArray();
     }
 
+    /** A file in the app's cache folder. */
+    public static File cacheFile(String name) {
+        return new File(app.getCacheDir(), name);
+    }
+
     public static String md5(String s) {
         try {
             byte[] d = MessageDigest.getInstance("MD5").digest(s.getBytes("UTF-8"));

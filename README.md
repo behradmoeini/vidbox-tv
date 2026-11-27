@@ -20,6 +20,7 @@ src/com/vidbox/tv/
   VbBrowseActivity.java     Home rows; Movies, TV Shows, Genres, Watchlist, Search grids
   VbDetailActivity.java     one title: facts, buttons, episodes or similar films
   VbPlayerActivity.java     the player
+  VbSubs.java               subtitles: the stream's own, fitted files, machine Persian
   VbUpdate.java             self-update
 .github/workflows/build-apk.yml   builds, signs and publishes every push to main
 .github/scripts/progress.sh       the "build progress" status on the commit
@@ -66,6 +67,33 @@ over them. So the player opens the server's page out of sight in a WebView, taps
 the page's `<video>` element has a film in it (longer than two minutes, so not an advert), only the
 picture is shown, full-screen, and that element is driven from the app: play, pause, seek, speed,
 and the position saved every five seconds for Resume.
+
+### Subtitles
+
+The servers' own subtitle menus are hidden with the rest of their pages, so the app draws its own
+(`VbSubs.java`), in a box inside the page over the picture, timed by the video's own clock.
+
+A subtitle file found on the internet is timed for some copy of the film, and for another copy it
+is seconds or minutes out, so no downloaded file is trusted on its name. The timing known to be
+right is the stream's own: most servers carry subtitle tracks for the very file they play (VidLink
+has sixteen languages; English, no Persian). So:
+
+- **English** is the stream's own track, read from the page's video element. Nothing to adjust.
+- **Persian** is the stream's own if it has one. Otherwise files from OpenSubtitles (through the
+  public Stremio add-on, by IMDb id) are tried, and one is used only if its lines start at the same
+  moments as the stream's English lines, up to one shift and one stretch, which `VbSubs.align`
+  measures; a file that does not fit is skipped. If none fits, the English track is translated by
+  machine, line for line, so it keeps the stream's timing exactly; the button then says
+  “(machine)”. A translation is kept on disk, so a film is translated once.
+- Only when a server carries no track at all is a downloaded file shown without that check, and
+  the button says “unchecked”.
+
+The Subtitles button opens a panel in the corner: Off / English / فارسی / both, what is being
+shown and why, another file, and a timing nudge for the unchecked case. Lines that only describe a
+sound are left out.
+
+To check timing on a device, play with `--es probe 0c`: the log then has a `SUB` line every second
+with the film's clock and the text on screen, to compare with the stream's cue times.
 
 ### Choosing the server
 
